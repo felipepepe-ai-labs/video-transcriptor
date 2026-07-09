@@ -24,6 +24,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import dub as dub_module
 import jobs as jobs_module
 import remote as remote_module
 
@@ -502,3 +503,143 @@ def test_mymemory_failure_falls_back_to_ollama(client, monkeypatch):
     assert result["translation_provider"] == "ollama"
     assert result["segments"][0]["text_es"] == "Hola mundo"
     assert result["segments"][1]["text_es"] == "Esto es una prueba"
+
+
+def test_muxing_failure_records_error_and_completes_job(client, monkeypatch):
+    """Narration/dubbing are bonuses on top of transcript+translation --
+    a failed mux must degrade gracefully (error recorded, job still
+    `done`), never sink the whole job. Uses fake video bytes: mux is
+    patched to raise before it would ever touch the video for real."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    def raise_mux(*args, **kwargs):
+        raise dub_module.DubbingFailed("ffmpeg mux error")
+
+    monkeypatch.setattr(app_module.dub, "mux_audio_into_video", raise_mux)
+    split_calls = []
+    monkeypatch.setattr(
+        app_module.dub, "split_video_by_chapters",
+        lambda *a, **k: split_calls.append((a, k)),
+    )
+
+    resp = submit(client, chapters=[{"time": 0, "title": "Intro"}])
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+
+    assert job["status"] == "done"
+    result = job["result"]
+    assert result["dubbed_video_error"] == "ffmpeg mux error"
+    assert result.get("dubbed_video_available") is False
+    # Splitting is guarded by dubbed_video_available -- must never run.
+    assert split_calls == []
+
+
+def test_chapter_split_failure_records_error_and_completes_job(client, monkeypatch, real_video_bytes):
+    """Same degradation contract as muxing failure, one stage later: a
+    successful mux followed by a failed split must still leave the job
+    `done`, with the split error recorded and the dubbed video preserved."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    def raise_split(*args, **kwargs):
+        raise dub_module.DubbingFailed("ffmpeg split error")
+
+    monkeypatch.setattr(app_module.dub, "split_video_by_chapters", raise_split)
+
+    resp = client.post(
+        "/jobs",
+        files={"video": ("clip.mp4", real_video_bytes, "video/mp4")},
+        data={"chapters_json": json.dumps([{"time": 0, "title": "Intro"}, {"time": 2.5, "title": "Parte 2"}])},
+    )
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+
+    assert job["status"] == "done"
+    result = job["result"]
+    assert result["dubbed_video_available"] is True
+    assert result["chapter_clips_error"] == "ffmpeg split error"
+    assert result.get("chapter_clips_available") is False
+
+
+def test_zero_chapters_skips_split_stage(client, monkeypatch, real_video_bytes):
+    """No chapter markers -> the splitting stage must never run, and the
+    result must not carry stale chapter_clips_* state beyond the default."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    split_calls = []
+    monkeypatch.setattr(
+        app_module.dub, "split_video_by_chapters",
+        lambda *a, **k: split_calls.append((a, k)),
+    )
+
+    resp = client.post(
+        "/jobs",
+        files={"video": ("clip.mp4", real_video_bytes, "video/mp4")},
+        data={},
+    )
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+
+    assert job["status"] == "done"
+    result = job["result"]
+    assert result["dubbed_video_available"] is True
+    assert split_calls == []
+    assert result["chapter_clips_available"] is False
+    assert "chapter_clips_error" not in result
+
+
+def test_work_dir_removed_after_full_success(client, monkeypatch, real_video_bytes):
+    """The work_dir (VIDEO_DIR/job_id/work) used to build the narration
+    track must be cleaned up after a fully successful run."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = client.post(
+        "/jobs",
+        files={"video": ("clip.mp4", real_video_bytes, "video/mp4")},
+        data={"chapters_json": json.dumps([{"time": 0, "title": "Intro"}])},
+    )
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+
+    assert job["status"] == "done"
+    work_dir = app_module.VIDEO_DIR / job_id / "work"
+    assert not work_dir.exists()
+
+
+def test_work_dir_removed_when_muxing_fails(client, monkeypatch):
+    """work_dir cleanup happens unconditionally after the mux/split try
+    blocks (inside `if narration_track is not None:`), so it must be
+    removed even when mux_audio_into_video raises DubbingFailed."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    def raise_mux(*args, **kwargs):
+        raise dub_module.DubbingFailed("ffmpeg mux error")
+
+    monkeypatch.setattr(app_module.dub, "mux_audio_into_video", raise_mux)
+
+    resp = submit(client, chapters=[{"time": 0, "title": "Intro"}])
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+
+    assert job["status"] == "done"
+    work_dir = app_module.VIDEO_DIR / job_id / "work"
+    assert not work_dir.exists()
