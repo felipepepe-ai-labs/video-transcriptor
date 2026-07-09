@@ -1,0 +1,16 @@
+# Backend (Python)
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+backend/jobs.db
+backend/uploads/
+backend/audio/
+backend/video/
+
+# Frontend (has its own frontend/.gitignore for node_modules/dist/etc.)
+
+# Local environment / tooling
+.env
+.claude/
+.atl/

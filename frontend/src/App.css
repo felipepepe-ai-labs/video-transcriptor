@@ -1,0 +1,688 @@
+/* ── App Layout ───────────────────────────────────────────────────── */
+
+.app {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+header h1 {
+  font-size: 1.75rem;
+  margin-bottom: 0.25rem;
+}
+
+header p {
+  color: #6b7280;
+  margin-bottom: 2rem;
+}
+
+/* ── Drop Zone ─────────────────────────────────────────────────────── */
+
+.upload-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.drop-zone {
+  border: 2px dashed #d1d5db;
+  border-radius: 1rem;
+  padding: 3rem 2rem;
+  text-align: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.drop-zone:hover,
+.drop-zone.active,
+.drop-zone:focus-visible {
+  border-color: #6366f1;
+  background: #eef2ff;
+}
+
+.drop-zone:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
+.upload-icon, .file-icon {
+  font-size: 2.5rem;
+}
+
+.file-info small {
+  color: #9ca3af;
+}
+
+.drop-zone small {
+  color: #9ca3af;
+}
+
+/* ── Voice Picker ──────────────────────────────────────────────────── */
+
+.voice-picker {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-size: 0.875rem;
+}
+
+.voice-picker-label {
+  color: #4b5563;
+  font-weight: 500;
+}
+
+.voice-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+}
+
+/* ── Chapters Editor ───────────────────────────────────────────────── */
+
+.chapters-editor {
+  border: 1px solid #e5e7eb;
+  border-radius: 0.6rem;
+  padding: 0.75rem 1rem;
+}
+
+.chapters-editor summary {
+  cursor: pointer;
+  font-weight: 500;
+  font-size: 0.9rem;
+  color: #4b5563;
+}
+
+.chapters-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.chapter-row-edit {
+  display: grid;
+  grid-template-columns: 90px 1fr auto;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.chapter-time-input,
+.chapter-title-input {
+  padding: 0.4rem 0.6rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.4rem;
+  font-size: 0.875rem;
+}
+
+.chapter-remove {
+  background: none;
+  border: none;
+  color: #9ca3af;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0.2rem 0.5rem;
+}
+
+.chapter-remove:hover {
+  color: #dc2626;
+}
+
+.btn-add-chapter {
+  padding: 0.4rem 0.9rem;
+  background: none;
+  border: 1px dashed #9ca3af;
+  border-radius: 0.4rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: #6366f1;
+}
+
+.btn-add-chapter:hover {
+  border-color: #6366f1;
+  background: #eef2ff;
+}
+
+.chapters-hint {
+  font-size: 0.75rem;
+  color: #9ca3af;
+  margin-top: 0.5rem;
+}
+
+.chapters-hint code {
+  background: #f3f4f6;
+  padding: 0.1rem 0.3rem;
+  border-radius: 0.2rem;
+}
+
+/* ── Chapter Nav (results) ────────────────────────────────────────── */
+
+.chapter-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.chapter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.75rem;
+  background: #eef2ff;
+  color: #4338ca;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  text-decoration: none;
+  transition: background 0.15s;
+}
+
+.chapter-pill:hover {
+  background: #e0e7ff;
+}
+
+.pill-ts {
+  font-weight: 600;
+  opacity: 0.75;
+}
+
+.chapter-pill-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.chapter-clip-download {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: #eef2ff;
+  text-decoration: none;
+  font-size: 0.75rem;
+}
+
+.chapter-clip-download:hover {
+  background: #e0e7ff;
+}
+
+/* ── Dubbed Video ──────────────────────────────────────────────────── */
+
+.dubbed-video {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.dubbed-video video {
+  width: 100%;
+  max-height: 400px;
+  border-radius: 0.5rem;
+  background: black;
+}
+
+/* ── Chapter Block (grouped segments) ─────────────────────────────── */
+
+.chapter-block {
+  margin-top: 1.75rem;
+  scroll-margin-top: 1rem;
+}
+
+.chapter-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: 1.05rem;
+  padding: 0.5rem 0;
+  border-bottom: 2px solid #6366f1;
+  margin-bottom: 0.5rem;
+  cursor: pointer;
+}
+
+.chapter-heading-ts {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #6366f1;
+  background: #eef2ff;
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.3rem;
+}
+
+.chapter-heading-count {
+  margin-left: auto;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #9ca3af;
+}
+
+/* ── Button ────────────────────────────────────────────────────────── */
+
+.btn-primary {
+  align-self: center;
+  padding: 0.75rem 2.5rem;
+  background: #6366f1;
+  color: white;
+  border: none;
+  border-radius: 0.6rem;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: #4f46e5;
+}
+
+.btn-primary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── Error ─────────────────────────────────────────────────────────── */
+
+.error-banner {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #dc2626;
+  padding: 0.75rem 1rem;
+  border-radius: 0.5rem;
+  font-size: 0.9rem;
+}
+
+/* ── Status Message ────────────────────────────────────────────────── */
+
+.status-message {
+  text-align: center;
+  padding: 1rem;
+  color: #6366f1;
+  font-weight: 500;
+}
+
+.spinner::before {
+  content: "";
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+  margin-right: 0.4rem;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.progress-wrap {
+  margin: 0.75rem auto 0;
+  max-width: 320px;
+}
+
+.progress-bar {
+  height: 0.5rem;
+  background: #e5e7eb;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-bar-fill {
+  height: 100%;
+  background: #6366f1;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.progress-bar-label {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: #6b7280;
+}
+
+/* ── History ───────────────────────────────────────────────────────── */
+
+.history-section {
+  margin-top: 1.5rem;
+}
+
+.history-heading {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #6b7280;
+  margin-bottom: 0.5rem;
+}
+
+.history-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0;
+  margin: 0;
+}
+
+.history-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.history-item {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.6rem;
+  flex: 1;
+  min-width: 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  background: white;
+  cursor: pointer;
+  text-align: left;
+  font-size: 0.85rem;
+}
+
+.history-item:hover {
+  background: #f9fafb;
+}
+
+.history-item.active {
+  border-color: #6366f1;
+  background: #eef2ff;
+}
+
+.history-delete {
+  flex-shrink: 0;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  background: white;
+  cursor: pointer;
+  font-size: 0.85rem;
+  line-height: 1;
+}
+
+.history-delete:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
+}
+
+.history-filename {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #1f2937;
+}
+
+.history-date {
+  color: #9ca3af;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+/* ── Results ───────────────────────────────────────────────────────── */
+
+.results {
+  margin-top: 2rem;
+}
+
+.meta-bar {
+  display: flex;
+  gap: 1.5rem;
+  padding: 0.75rem 1rem;
+  background: #f9fafb;
+  border-radius: 0.5rem;
+  font-size: 0.875rem;
+  color: #4b5563;
+  flex-wrap: wrap;
+}
+
+/* ── Narration Audio ───────────────────────────────────────────────── */
+
+.audio-player {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.audio-player audio {
+  flex: 1;
+  min-width: 220px;
+}
+
+.audio-download {
+  font-size: 0.8rem;
+  color: #6366f1;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.audio-download:hover {
+  text-decoration: underline;
+}
+
+.audio-error {
+  margin-top: 0.75rem;
+  font-size: 0.8rem;
+  color: #9ca3af;
+}
+
+/* ── Tabs ──────────────────────────────────────────────────────────── */
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin: 1rem 0;
+}
+
+.tabs button {
+  padding: 0.4rem 1rem;
+  border: 1px solid #d1d5db;
+  background: white;
+  border-radius: 0.4rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  transition: all 0.1s;
+}
+
+.tabs button.active {
+  background: #6366f1;
+  color: white;
+  border-color: #6366f1;
+}
+
+/* ── Segments ──────────────────────────────────────────────────────── */
+
+.segments {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.segment-row {
+  display: grid;
+  grid-template-columns: 60px 1fr;
+  gap: 0.75rem;
+  padding: 0.45rem 0.75rem;
+  border-radius: 0.35rem;
+  font-size: 0.925rem;
+  line-height: 1.5;
+}
+
+.segment-row:hover {
+  background: #f5f5f5;
+}
+
+.ts {
+  color: #9ca3af;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  padding-top: 0.15rem;
+}
+
+.text {
+  color: #1f2937;
+}
+
+/* ── Full Text (collapsible) ───────────────────────────────────────── */
+
+.full-text {
+  margin-top: 1.5rem;
+}
+
+.full-text summary {
+  cursor: pointer;
+  font-weight: 500;
+  padding: 0.5rem 0;
+}
+
+.full-text pre {
+  background: #f3f4f6;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+/* ── Actions ───────────────────────────────────────────────────────── */
+
+.actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+
+.actions button {
+  padding: 0.5rem 1rem;
+  border: 1px solid #d1d5db;
+  background: white;
+  border-radius: 0.4rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+}
+
+.actions button:hover {
+  background: #f3f4f6;
+}
+
+/* ── Dark mode (follows system) ───────────────────────────────────── */
+
+@media (prefers-color-scheme: dark) {
+  .drop-zone:hover,
+  .drop-zone.active {
+    background: #1e1b4b20;
+  }
+  .meta-bar {
+    background: #1f2937;
+    color: #d1d5db;
+  }
+  .segment-row:hover {
+    background: #1f2937;
+  }
+  .text {
+    color: #e5e7eb;
+  }
+  .full-text pre {
+    background: #1f2937;
+  }
+  .tabs button,
+  .actions button {
+    background: #1f2937;
+    color: #e5e7eb;
+    border-color: #4b5563;
+  }
+  .actions button:hover {
+    background: #374151;
+  }
+  .chapter-remove:hover {
+    color: #f87171;
+  }
+  .btn-add-chapter:hover {
+    background: #1e1b4b20;
+  }
+  .chapters-editor {
+    border-color: #4b5563;
+  }
+  .chapters-editor summary {
+    color: #d1d5db;
+  }
+  .chapter-time-input,
+  .chapter-title-input {
+    background: #1f2937;
+    border-color: #4b5563;
+    color: #e5e7eb;
+  }
+  .chapters-hint code {
+    background: #374151;
+  }
+  .chapter-pill {
+    background: #312e81;
+    color: #c7d2fe;
+  }
+  .chapter-pill:hover {
+    background: #3730a3;
+  }
+  .chapter-clip-download {
+    background: #312e81;
+  }
+  .chapter-clip-download:hover {
+    background: #3730a3;
+  }
+  .chapter-heading-ts {
+    background: #312e81;
+    color: #a5b4fc;
+  }
+  .chapter-heading-count {
+    color: #6b7280;
+  }
+  .progress-bar {
+    background: #374151;
+  }
+  .history-item {
+    background: #111827;
+    border-color: #4b5563;
+  }
+  .history-item:hover {
+    background: #1f2937;
+  }
+  .history-item.active {
+    background: #312e81;
+    border-color: #6366f1;
+  }
+  .history-filename {
+    color: #e5e7eb;
+  }
+  .voice-picker-label {
+    color: #d1d5db;
+  }
+  .audio-error {
+    color: #6b7280;
+  }
+  .history-delete {
+    background: #111827;
+    border-color: #4b5563;
+  }
+  .history-delete:hover {
+    background: #450a0a;
+    border-color: #7f1d1d;
+  }
+}
