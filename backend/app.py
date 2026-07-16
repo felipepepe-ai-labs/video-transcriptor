@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse
 
 import dub
 import jobs
+import youtube
 from remote import (
     InsufficientRemoteStorage,
     RemoteUnavailable,
@@ -206,12 +207,18 @@ def _run_narration_and_dub(job_id, remote, local_path, duration, segments, forma
 
 
 def run_transcription_job(
-    job_id: str, local_path: Path, filename: str, chapters: list[dict], voice: str
+    job_id: str, local_path: Path, filename: str, chapters: list[dict], voice: str,
+    source_language: str | None = "en", source: str = "upload", url: Optional[str] = None,
 ) -> None:
     """Runs the full transcribe -> translate lifecycle for one job, updating
     job stage/status as it progresses. Any domain error is caught and stored
     on the job record (status=failed, error=<message>) since a background
-    task has no HTTP response to raise into."""
+    task has no HTTP response to raise into.
+
+    `source_language=None` lets whisper auto-detect (YouTube path). When the
+    source turns out to already be Spanish, translation and narration/dubbing
+    are skipped: there is nothing to translate and re-voicing Spanish over
+    Spanish is pointless."""
     jobs.update_job(job_id, status="running", stage="uploading")
     remote = RemoteWhisper()
 
@@ -223,26 +230,32 @@ def run_transcription_job(
             remote.upload(local_path, filename)
 
             jobs.update_job(job_id, stage="transcribing")
-            srt_content, duration = remote.run_transcribe()
+            srt_content, duration, detected_language = remote.run_transcribe(language=source_language)
+            spanish_source = detected_language in ("es", "spanish")
 
             segments = parse_srt(srt_content)
             assign_chapters(segments, chapters)
 
-            texts_en = [s["text_en"] for s in segments]
-            jobs.update_job(
-                job_id, stage="translating", progress=0.0,
-                segments_done=0, segments_total=len(texts_en),
-            )
-
-            def report_translation_progress(done: int, total: int) -> None:
+            if spanish_source:
+                for seg in segments:
+                    seg["text_es"] = seg["text_en"]
+                provider = "source-es"
+            else:
+                texts_en = [s["text_en"] for s in segments]
                 jobs.update_job(
-                    job_id, segments_done=done, segments_total=total,
-                    progress=round(done / total * 100, 1) if total else 0.0,
+                    job_id, stage="translating", progress=0.0,
+                    segments_done=0, segments_total=len(texts_en),
                 )
 
-            texts_es, provider = translate_with_fallback(texts_en, on_progress=report_translation_progress)
-            for seg, text_es in zip(segments, texts_es):
-                seg["text_es"] = text_es
+                def report_translation_progress(done: int, total: int) -> None:
+                    jobs.update_job(
+                        job_id, segments_done=done, segments_total=total,
+                        progress=round(done / total * 100, 1) if total else 0.0,
+                    )
+
+                texts_es, provider = translate_with_fallback(texts_en, on_progress=report_translation_progress)
+                for seg, text_es in zip(segments, texts_es):
+                    seg["text_es"] = text_es
 
             full_en = "\n".join(s["text_en"] for s in segments)
             full_es = "\n".join(s["text_es"] for s in segments)
@@ -257,6 +270,9 @@ def run_transcription_job(
 
             result = {
                 "filename": filename,
+                "source": source,
+                "url": url,
+                "source_language": detected_language,
                 "duration_seconds": duration,
                 "chapters": formatted_chapters,
                 "segments": segments,
@@ -269,7 +285,8 @@ def run_transcription_job(
                 "chapter_clips_available": False,
             }
 
-            _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result)
+            if not spanish_source:
+                _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result)
 
             jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
 
@@ -283,6 +300,35 @@ def run_transcription_job(
             jobs.update_job(job_id, status="failed", error=_error_message("500 Job failed", e))
     finally:
         remote.cleanup()
+
+
+def run_youtube_job(job_id: str, url: str, chapters: list[dict], voice: str) -> None:
+    """Downloads a YouTube video into UPLOAD_DIR (same {job_id}.mp4 naming
+    contract as uploads, so retts/chapter reruns keep working) and hands it
+    to the regular pipeline with whisper language auto-detection."""
+    jobs.update_job(job_id, status="running", stage="downloading")
+    local_path = UPLOAD_DIR / f"{job_id}.mp4"
+
+    try:
+        meta = youtube.download_video(url, local_path)
+    except youtube.DownloadFailed as e:
+        jobs.update_job(job_id, status="failed", error=_error_message("502 YouTube download failed", e))
+        return
+    except Exception as e:
+        jobs.update_job(job_id, status="failed", error=_error_message("500 YouTube download failed", e))
+        return
+
+    title = meta["title"]
+    # The video's own chapter markers are adopted only when the user didn't
+    # provide explicit ones -- explicit input always wins.
+    if not chapters:
+        chapters = meta.get("chapters") or []
+    jobs.update_job(job_id, title=title, filename=f"{title}.mp4")
+
+    run_transcription_job(
+        job_id, local_path, f"{title}.mp4", chapters, voice,
+        source_language=None, source="youtube", url=url,
+    )
 
 
 def rerun_narration_job(job_id: str, voice: str) -> None:
@@ -455,6 +501,35 @@ async def create_job(
         shutil.copyfileobj(video.file, f, length=1048576)
 
     background_tasks.add_task(run_transcription_job, job_id, local_path, video.filename, chapters, voice)
+
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/jobs/youtube")
+async def create_youtube_job(
+    background_tasks: BackgroundTasks,
+    url: str = Form(...),
+    chapters_json: Optional[str] = Form(None),
+    voice: str = Form("male"),
+):
+    """Enqueue a transcription job for a YouTube URL. The video is downloaded
+    server-side with yt-dlp; language is auto-detected (a Spanish video gets
+    transcript-only treatment, an English one runs the full dub pipeline)."""
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(400, "url must be an http(s) URL")
+
+    chapters = []
+    if chapters_json:
+        try:
+            chapters = json.loads(chapters_json)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "Invalid chapters JSON format")
+
+    if voice not in ("male", "female"):
+        raise HTTPException(400, "voice must be 'male' or 'female'")
+
+    job_id = jobs.create_job(url, source="youtube", url=url)
+    background_tasks.add_task(run_youtube_job, job_id, url, chapters, voice)
 
     return {"job_id": job_id, "status": "queued"}
 

@@ -119,15 +119,17 @@ class RemoteWhisper:
             sftp.close()
         return self._remote_path
 
-    def run_transcribe(self) -> tuple[str, float]:
-        """Run `whisper --task transcribe`. Returns (srt_content, duration_seconds).
+    def run_transcribe(self, language: str | None = "en") -> tuple[str, float, str]:
+        """Run `whisper --task transcribe`. Returns (srt_content,
+        duration_seconds, language) -- `language` echoes the forced source
+        language, or the one whisper auto-detected when None is passed.
 
         Note: there is no run_translate() here. Whisper's --task translate
         only ever translates speech INTO English, never into an arbitrary
         target language, so it can't serve as an EN->ES translator. See
         translate.py's OllamaTranslator for the EN->ES fallback instead.
         """
-        return self._run_whisper_task("transcribe")
+        return self._run_whisper_task("transcribe", language=language)
 
     def run_tts_batch(
         self,
@@ -207,17 +209,20 @@ class RemoteWhisper:
             self._ssh = None
 
     # ── Internal ─────────────────────────────────────────────────────
-    def _run_whisper_task(self, task: str) -> tuple[str, float]:
+    def _run_whisper_task(self, task: str, language: str | None = "en") -> tuple[str, float, str]:
         if self._ssh is None or self._remote_path is None or self._file_id is None:
             raise RuntimeError("upload() must be called before running whisper")
 
         out_dir = f"/tmp/whisper_out_{self._file_id}_{task}"
         self._out_dirs.append(out_dir)
 
+        # No --language flag -> whisper auto-detects the spoken language and
+        # records it in the output JSON (parsed below).
+        language_flag = f"--language {language} " if language else ""
         cmd = (
             f"cd /tmp && python3 -m whisper {self._remote_path} "
             f"--model {self.model} --task {task} "
-            f"--language en --output_format all "
+            f"{language_flag}--output_format all "
             f"--output_dir {out_dir} "
             f"--device {self.device}"
         )
@@ -248,6 +253,7 @@ class RemoteWhisper:
         srt_content = out.read().decode("utf-8", errors="replace")
 
         duration = 0.0
+        detected_language = language or ""
         remote_json_path = remote_srt.replace(".srt", ".json")
         try:
             _, out_j, _ = self._ssh.exec_command(f"cat {remote_json_path}")
@@ -255,7 +261,8 @@ class RemoteWhisper:
             segs = json_data.get("segments", [])
             if segs:
                 duration = max(s.get("end", 0) for s in segs)
+            detected_language = json_data.get("language") or detected_language
         except Exception:
             pass
 
-        return srt_content, duration
+        return srt_content, duration, detected_language

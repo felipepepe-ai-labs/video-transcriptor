@@ -37,30 +37,41 @@ def init_db() -> None:
                 created_at REAL,
                 updated_at REAL,
                 segments_done INTEGER DEFAULT 0,
-                segments_total INTEGER DEFAULT 0
+                segments_total INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'upload',
+                title TEXT,
+                url TEXT
             )
             """
         )
-        # Migration for DBs created before segments_done/segments_total existed.
+        # Migrations for DBs created before these columns existed.
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
-        for col in ("segments_done", "segments_total"):
+        for col, decl in (
+            ("segments_done", "INTEGER DEFAULT 0"),
+            ("segments_total", "INTEGER DEFAULT 0"),
+            ("source", "TEXT DEFAULT 'upload'"),
+            ("title", "TEXT"),
+            ("url", "TEXT"),
+        ):
             if col not in existing_cols:
-                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} INTEGER DEFAULT 0")
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
         conn.commit()
     finally:
         conn.close()
 
 
-def create_job(filename: str) -> str:
+def create_job(filename: str, source: str = "upload", title: str | None = None, url: str | None = None) -> str:
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
+    initial_stage = "downloading" if source == "youtube" else "uploading"
     conn = _get_conn()
     try:
         with _lock:
             conn.execute(
                 "INSERT INTO jobs (id, filename, status, stage, progress, error, result_json, "
-                "created_at, updated_at) VALUES (?, ?, 'queued', 'uploading', 0.0, NULL, NULL, ?, ?)",
-                (job_id, filename, now, now),
+                "created_at, updated_at, source, title, url) "
+                "VALUES (?, ?, 'queued', ?, 0.0, NULL, NULL, ?, ?, ?, ?, ?)",
+                (job_id, filename, initial_stage, now, now, source, title, url),
             )
             conn.commit()
     finally:
@@ -119,7 +130,8 @@ def list_jobs(limit: int = 50) -> list[dict]:
     try:
         rows = conn.execute(
             "SELECT id, filename, status, stage, progress, error, "
-            "segments_done, segments_total, created_at, updated_at "
+            "segments_done, segments_total, created_at, updated_at, "
+            "source, title, url "
             "FROM jobs ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()

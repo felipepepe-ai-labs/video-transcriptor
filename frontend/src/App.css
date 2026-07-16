@@ -786,3 +786,56 @@ header p {
     border-color: #7f1d1d;
   }
 }
+
+/* ── Input Mode Toggle (Archivo / YouTube) ─────────────────────────── */
+
+.input-mode-toggle {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.input-mode-toggle button {
+  padding: 0.4rem 1rem;
+  border: 1px solid #d1d5db;
+  background: white;
+  border-radius: 0.4rem;
+  cursor: pointer;
+  font-size: 0.875rem;
+  transition: all 0.1s;
+}
+
+.input-mode-toggle button.active {
+  background: #6366f1;
+  color: white;
+  border-color: #6366f1;
+}
+
+.youtube-input {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.youtube-input input {
+  padding: 0.75rem 1rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.5rem;
+  font-size: 0.925rem;
+  width: 100%;
+}
+
+.youtube-input input:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+
+.youtube-hint {
+  color: #6b7280;
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.history-source {
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}

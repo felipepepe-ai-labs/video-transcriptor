@@ -5,6 +5,7 @@ const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 const POLL_INTERVAL_MS = 2000
 
 const STAGE_LABELS = {
+  downloading: "Descargando video de YouTube...",
   uploading: "Subiendo video...",
   transcribing: "Transcribiendo con Whisper...",
   translating: "Traduciendo al español...",
@@ -23,6 +24,8 @@ const STATUS_ICONS = {
 }
 
 function App() {
+  const [inputMode, setInputMode] = useState("file") // "file" | "youtube"
+  const [youtubeUrl, setYoutubeUrl] = useState("")
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
   const [job, setJob] = useState(null) // { status, stage, progress, error, result }
@@ -47,6 +50,8 @@ function App() {
 
   useEffect(() => {
     if (result?.voice) setRegenVoice(result.voice)
+    // A Spanish-source video has no EN text to show -- force the ES tab.
+    if (result?.source_language === "es") setTab("es")
   }, [result])
 
   useEffect(() => {
@@ -150,16 +155,14 @@ function App() {
   }
 
   async function handleSubmit() {
-    if (!file) return
+    if (inputMode === "file" ? !file : !youtubeUrl.trim()) return
     setLoading(true)
     setError("")
     setResult(null)
     setJob(null)
-    setUploadProgress(0)
     stopPolling()
 
     const formData = new FormData()
-    formData.append("video", file)
     formData.append("voice", voice)
 
     const cleanChapters = chapters
@@ -170,6 +173,24 @@ function App() {
       formData.append("chapters_json", JSON.stringify(cleanChapters))
     }
 
+    if (inputMode === "youtube") {
+      formData.append("url", youtubeUrl.trim())
+      try {
+        const res = await fetch(`${API_URL}/jobs/youtube`, { method: "POST", body: formData })
+        const body = await res.json().catch(() => ({}))
+        if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
+        setJob({ status: "queued", stage: "downloading" })
+        pollJob(body.job_id)
+        refreshHistory()
+      } catch (e) {
+        setError(e.message)
+        setLoading(false)
+      }
+      return
+    }
+
+    formData.append("video", file)
+    setUploadProgress(0)
     try {
       const { job_id } = await uploadWithProgress(formData, setUploadProgress)
       setUploadProgress(null)
@@ -266,16 +287,58 @@ function App() {
   }
 
   const groups = result ? groupByChapter(result.segments, result.chapters) : []
+  // Spanish-source videos (YouTube auto-detect) have no translation and no
+  // narration/dub -- hide every EN/TTS affordance for them.
+  const spanishSource = result?.source_language === "es"
 
   return (
     <div className="app">
       <header>
         <h1>🎬 Video → Transcripción ES</h1>
-        <p>Subí un video en inglés y obtené la transcripción con traducción al español</p>
+        <p>Subí un video o pegá una URL de YouTube: transcripción, traducción al español y doblaje</p>
       </header>
 
       {/* Upload area */}
       <section className="upload-section">
+        <div className="input-mode-toggle" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "file"}
+            className={inputMode === "file" ? "active" : ""}
+            onClick={() => setInputMode("file")}
+          >
+            📁 Archivo
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "youtube"}
+            className={inputMode === "youtube" ? "active" : ""}
+            onClick={() => setInputMode("youtube")}
+          >
+            ▶️ YouTube
+          </button>
+        </div>
+
+        {inputMode === "youtube" && (
+          <div className="youtube-input">
+            <input
+              type="url"
+              placeholder="https://www.youtube.com/watch?v=..."
+              value={youtubeUrl}
+              onChange={(e) => setYoutubeUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") handleSubmit() }}
+              aria-label="URL del video de YouTube"
+            />
+            <p className="youtube-hint">
+              El idioma se detecta automáticamente: un video en inglés se traduce y dobla;
+              uno en español solo se transcribe. Si el video tiene capítulos propios, se usan.
+            </p>
+          </div>
+        )}
+
+        {inputMode === "file" && (
         <div
           className={`drop-zone ${dragOver ? "active" : ""}`}
           role="button"
@@ -313,6 +376,7 @@ function App() {
             </>
           )}
         </div>
+        )}
 
         {/* Voice selection */}
         <div className="voice-picker">
@@ -386,7 +450,7 @@ function App() {
 
         <button
           className="btn-primary"
-          disabled={!file || loading}
+          disabled={(inputMode === "file" ? !file : !youtubeUrl.trim()) || loading}
           onClick={handleSubmit}
         >
           {loading ? (
@@ -424,7 +488,10 @@ function App() {
                   <span className={`history-status status-${h.status}`}>
                     {STATUS_ICONS[h.status] ?? "•"}
                   </span>
-                  <span className="history-filename">{h.filename}</span>
+                  <span className="history-source" title={h.source === "youtube" ? "Video de YouTube" : "Archivo subido"}>
+                    {h.source === "youtube" ? "▶️" : "📁"}
+                  </span>
+                  <span className="history-filename">{h.title || h.filename}</span>
                   <span className="history-date">{formatDate(h.created_at)}</span>
                 </button>
                 <button
@@ -446,6 +513,10 @@ function App() {
         <section className="results">
           <div className="meta-bar">
             <span>📄 {result.filename}</span>
+            {result.source === "youtube" && result.url && (
+              <a href={result.url} target="_blank" rel="noreferrer">▶️ Ver en YouTube</a>
+            )}
+            {result.source_language === "es" && <span>🌐 Video en español (sin traducir)</span>}
             <span>⏱ {formatDuration(result.duration_seconds)}</span>
             <span>🧩 {result.segments.length} segmentos</span>
             {result.chapters?.length > 0 && <span>📑 {result.chapters.length} capítulos</span>}
@@ -486,6 +557,7 @@ function App() {
           )}
 
           {/* Regenerate narration (whole job) */}
+          {!spanishSource && (
           <div className="regen-narration">
             <label className="voice-option">
               <input
@@ -516,6 +588,7 @@ function App() {
               🔁 Regenerar locución
             </button>
           </div>
+          )}
 
           {/* Chapter jump nav + per-chapter clip download */}
           {result.chapters?.length > 0 && (
@@ -536,16 +609,18 @@ function App() {
                       ⬇️
                     </a>
                   )}
-                  <button
-                    type="button"
-                    className="chapter-clip-regen"
-                    disabled={loading}
-                    onClick={() => regenerateChapter(i)}
-                    title="Regenerar la locución de este capítulo"
-                    aria-label={`Regenerar locución del capítulo ${ch.title}`}
-                  >
-                    🔁
-                  </button>
+                  {!spanishSource && (
+                    <button
+                      type="button"
+                      className="chapter-clip-regen"
+                      disabled={loading}
+                      onClick={() => regenerateChapter(i)}
+                      title="Regenerar la locución de este capítulo"
+                      aria-label={`Regenerar locución del capítulo ${ch.title}`}
+                    >
+                      🔁
+                    </button>
+                  )}
                 </span>
               ))}
             </nav>
@@ -554,6 +629,7 @@ function App() {
             <div className="audio-error">✂️ No se pudieron recortar los capítulos: {result.chapter_clips_error}</div>
           )}
 
+          {!spanishSource && (
           <div className="tabs">
             <button
               className={tab === "es" ? "active" : ""}
@@ -568,6 +644,7 @@ function App() {
               English
             </button>
           </div>
+          )}
 
           {/* Long transcripts (many chapters, thousands of segments) collapse
               every chapter but the first, so the DOM isn't flooded with rows
@@ -580,15 +657,17 @@ function App() {
                     <span className="chapter-heading-ts">{group.timestamp}</span>
                     {group.title}
                     <span className="chapter-heading-count">{group.segments.length}</span>
-                    <button
-                      type="button"
-                      className="chapter-tts-btn"
-                      disabled={loading}
-                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); generateChapterAudio(group.chapterIndex) }}
-                      title="Generar audio de este capítulo"
-                    >
-                      {chapterAudioLoading === group.chapterIndex ? "⏳" : "🔊"} Generar audio
-                    </button>
+                    {!spanishSource && (
+                      <button
+                        type="button"
+                        className="chapter-tts-btn"
+                        disabled={loading}
+                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); generateChapterAudio(group.chapterIndex) }}
+                        title="Generar audio de este capítulo"
+                      >
+                        {chapterAudioLoading === group.chapterIndex ? "⏳" : "🔊"} Generar audio
+                      </button>
+                    )}
                   </summary>
                   <div className="segments">
                     {group.segments.map((seg) => (
