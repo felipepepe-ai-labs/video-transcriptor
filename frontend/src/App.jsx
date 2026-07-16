@@ -9,6 +9,7 @@ const STAGE_LABELS = {
   transcribing: "Transcribiendo con Whisper...",
   translating: "Traduciendo al español...",
   voicing: "Generando locución por segmento...",
+  voicing_chapter: "Regenerando locución del capítulo...",
   dubbing: "Mezclando el audio con el video...",
   splitting: "Recortando el video por capítulos...",
   done: "Listo",
@@ -33,12 +34,31 @@ function App() {
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
   const [history, setHistory] = useState([])
+  const [uploadProgress, setUploadProgress] = useState(null) // 0-100 while sending, null otherwise
+  const [regenVoice, setRegenVoice] = useState("male")
+  const [chapterAudioReady, setChapterAudioReady] = useState({}) // { [chapterIndex]: true }
+  const [chapterAudioLoading, setChapterAudioLoading] = useState(null) // chapterIndex currently generating, or null
   const pollRef = useRef(null)
 
   useEffect(() => {
     refreshHistory()
     return () => stopPolling()
   }, [])
+
+  useEffect(() => {
+    if (result?.voice) setRegenVoice(result.voice)
+  }, [result])
+
+  useEffect(() => {
+    setChapterAudioReady({})
+    setChapterAudioLoading(null)
+  }, [job?.id])
+
+  useEffect(() => {
+    // Covers the "failed" path too, not just success -- otherwise a failed
+    // chapter-audio generation left the button stuck showing its spinner.
+    if (job && job.status !== "running") setChapterAudioLoading(null)
+  }, [job])
 
   async function refreshHistory() {
     try {
@@ -99,7 +119,7 @@ function App() {
     }
   }
 
-  function pollJob(jobId) {
+  function pollJob(jobId, onDone) {
     pollRef.current = setTimeout(async () => {
       try {
         const res = await fetch(`${API_URL}/jobs/${jobId}`)
@@ -112,13 +132,14 @@ function App() {
           setLoading(false)
           stopPolling()
           refreshHistory()
+          onDone?.()
         } else if (data.status === "failed") {
           setError(data.error ?? "La transcripción falló")
           setLoading(false)
           stopPolling()
           refreshHistory()
         } else {
-          pollJob(jobId)
+          pollJob(jobId, onDone)
         }
       } catch (e) {
         setError(e.message)
@@ -134,6 +155,7 @@ function App() {
     setError("")
     setResult(null)
     setJob(null)
+    setUploadProgress(0)
     stopPolling()
 
     const formData = new FormData()
@@ -149,19 +171,13 @@ function App() {
     }
 
     try {
-      const res = await fetch(`${API_URL}/jobs`, {
-        method: "POST",
-        body: formData,
-      })
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}))
-        throw new Error(err.detail ?? `HTTP ${res.status}`)
-      }
-      const { job_id } = await res.json()
+      const { job_id } = await uploadWithProgress(formData, setUploadProgress)
+      setUploadProgress(null)
       setJob({ status: "queued", stage: "uploading" })
       pollJob(job_id)
       refreshHistory()
     } catch (e) {
+      setUploadProgress(null)
       setError(e.message)
       setLoading(false)
     }
@@ -172,6 +188,55 @@ function App() {
     setDragOver(false)
     const f = e.dataTransfer.files[0]
     if (f) setFile(f)
+  }
+
+  async function retts(url, voiceValue) {
+    if (!job?.id) return
+    setLoading(true)
+    setError("")
+    const formData = new FormData()
+    if (voiceValue) formData.append("voice", voiceValue)
+    try {
+      const res = await fetch(url, { method: "POST", body: formData })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail ?? `HTTP ${res.status}`)
+      }
+      pollJob(job.id)
+    } catch (e) {
+      setError(e.message)
+      setLoading(false)
+    }
+  }
+
+  function regenerateNarration() {
+    retts(`${API_URL}/jobs/${job.id}/retts`, regenVoice)
+  }
+
+  function regenerateChapter(index) {
+    retts(`${API_URL}/jobs/${job.id}/chapters/${index}/retts`)
+  }
+
+  async function generateChapterAudio(index) {
+    if (!job?.id) return
+    setLoading(true)
+    setChapterAudioLoading(index)
+    setError("")
+    try {
+      const res = await fetch(`${API_URL}/jobs/${job.id}/chapters/${index}/audio`, { method: "POST" })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}))
+        throw new Error(err.detail ?? `HTTP ${res.status}`)
+      }
+      pollJob(job.id, () => {
+        setChapterAudioReady((prev) => ({ ...prev, [index]: true }))
+        setChapterAudioLoading(null)
+      })
+    } catch (e) {
+      setError(e.message)
+      setLoading(false)
+      setChapterAudioLoading(null)
+    }
   }
 
   function addChapter() {
@@ -325,11 +390,22 @@ function App() {
           onClick={handleSubmit}
         >
           {loading ? (
-            <span className="spinner">⏳ Transcribiendo…</span>
+            <span className="spinner">
+              {uploadProgress !== null ? `Subiendo… ${uploadProgress}%` : "Transcribiendo…"}
+            </span>
           ) : (
             "Transcribir"
           )}
         </button>
+
+        {uploadProgress !== null && (
+          <div className="progress-wrap">
+            <div className="progress-bar">
+              <div className="progress-bar-fill" style={{ width: `${uploadProgress}%` }} />
+            </div>
+            <span className="progress-bar-label">Subiendo video: {uploadProgress}%</span>
+          </div>
+        )}
 
         {error && <div className="error-banner">❌ {error}</div>}
       </section>
@@ -409,6 +485,38 @@ function App() {
             <div className="audio-error">🎬 No se pudo generar el video doblado: {result.dubbed_video_error}</div>
           )}
 
+          {/* Regenerate narration (whole job) */}
+          <div className="regen-narration">
+            <label className="voice-option">
+              <input
+                type="radio"
+                name="regenVoice"
+                value="male"
+                checked={regenVoice === "male"}
+                onChange={() => setRegenVoice("male")}
+              />
+              Masculina
+            </label>
+            <label className="voice-option">
+              <input
+                type="radio"
+                name="regenVoice"
+                value="female"
+                checked={regenVoice === "female"}
+                onChange={() => setRegenVoice("female")}
+              />
+              Femenina
+            </label>
+            <button
+              type="button"
+              className="btn-regen"
+              disabled={loading}
+              onClick={regenerateNarration}
+            >
+              🔁 Regenerar locución
+            </button>
+          </div>
+
           {/* Chapter jump nav + per-chapter clip download */}
           {result.chapters?.length > 0 && (
             <nav className="chapter-nav">
@@ -428,6 +536,16 @@ function App() {
                       ⬇️
                     </a>
                   )}
+                  <button
+                    type="button"
+                    className="chapter-clip-regen"
+                    disabled={loading}
+                    onClick={() => regenerateChapter(i)}
+                    title="Regenerar la locución de este capítulo"
+                    aria-label={`Regenerar locución del capítulo ${ch.title}`}
+                  >
+                    🔁
+                  </button>
                 </span>
               ))}
             </nav>
@@ -456,23 +574,46 @@ function App() {
               the user hasn't scrolled to yet. */}
           {groups.map((group, gi) =>
             group.title ? (
-              <details key={gi} className="chapter-block" id={group.id} open={gi === 0 || groups.length <= 3}>
-                <summary className="chapter-heading">
-                  <span className="chapter-heading-ts">{group.timestamp}</span>
-                  {group.title}
-                  <span className="chapter-heading-count">{group.segments.length}</span>
-                </summary>
-                <div className="segments">
-                  {group.segments.map((seg) => (
-                    <div key={seg.index} className="segment-row">
-                      <span className="ts" title={`${seg.start}s → ${seg.end}s`}>
-                        {formatTs(seg.start)}
-                      </span>
-                      <span className="text">{tab === "es" ? seg.text_es : seg.text_en}</span>
-                    </div>
-                  ))}
-                </div>
-              </details>
+              <div key={gi}>
+                <details className="chapter-block" id={group.id} open={gi === 0 || groups.length <= 3}>
+                  <summary className="chapter-heading">
+                    <span className="chapter-heading-ts">{group.timestamp}</span>
+                    {group.title}
+                    <span className="chapter-heading-count">{group.segments.length}</span>
+                    <button
+                      type="button"
+                      className="chapter-tts-btn"
+                      disabled={loading}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); generateChapterAudio(group.chapterIndex) }}
+                      title="Generar audio de este capítulo"
+                    >
+                      {chapterAudioLoading === group.chapterIndex ? "⏳" : "🔊"} Generar audio
+                    </button>
+                  </summary>
+                  <div className="segments">
+                    {group.segments.map((seg) => (
+                      <div key={seg.index} className="segment-row">
+                        <span className="ts" title={`${seg.start}s → ${seg.end}s`}>
+                          {formatTs(seg.start)}
+                        </span>
+                        <span className="text">{tab === "es" ? seg.text_es : seg.text_en}</span>
+                      </div>
+                    ))}
+                  </div>
+                </details>
+                {/* Rendered outside <details> so it stays visible even when
+                    this chapter is collapsed -- <details> content besides
+                    <summary> is hidden by the browser while closed.
+                    `result.chapter_audio_indexes` (persisted on the job) is
+                    the source of truth -- `chapterAudioReady` only covers
+                    the same-session "just generated it" case before the
+                    next poll response lands. */}
+                {(chapterAudioReady[group.chapterIndex] || result.chapter_audio_indexes?.includes(group.chapterIndex)) && (
+                  <div className="chapter-audio-player">
+                    <audio controls src={`${API_URL}/jobs/${job.id}/chapters/${group.chapterIndex}/audio`} />
+                  </div>
+                )}
+              </div>
             ) : (
               <div key={gi} className="chapter-block" id={group.id}>
                 <div className="segments">
@@ -511,7 +652,7 @@ function App() {
         </section>
       )}
 
-      {loading && (
+      {loading && uploadProgress === null && (
         <div className="status-message">
           <span className="spinner"></span>
           {STAGE_LABELS[job?.stage] ?? "Enviando video a Whisper..."}
@@ -568,6 +709,7 @@ function groupByChapter(segments, chapters) {
     })
     return {
       id: `chapter-${i}`,
+      chapterIndex: i,
       title: ch.title,
       timestamp: ch.timestamp,
       segments: segs,
@@ -581,6 +723,33 @@ function tsStringToSeconds(ts) {
   const m = parseInt(parts[1] || "0", 10)
   const s = parseFloat(parts[2] || "0")
   return h * 3600 + m * 60 + s
+}
+
+function uploadWithProgress(formData, onProgress) {
+  // fetch() has no cross-browser event for upload (request body) progress,
+  // only for the response -- XMLHttpRequest is the only way to report how
+  // much of a large video has actually left the browser.
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open("POST", `${API_URL}/jobs`)
+
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+    }
+
+    xhr.onload = () => {
+      let body = {}
+      try { body = JSON.parse(xhr.responseText) } catch { /* non-JSON error body */ }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body)
+      } else {
+        reject(new Error(body.detail ?? `HTTP ${xhr.status}`))
+      }
+    }
+
+    xhr.onerror = () => reject(new Error("No se pudo conectar con el servidor"))
+    xhr.send(formData)
+  })
 }
 
 function downloadSrt(segments, lang) {

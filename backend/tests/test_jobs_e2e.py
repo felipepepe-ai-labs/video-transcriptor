@@ -471,6 +471,163 @@ def test_full_pipeline_dubs_video_and_splits_by_chapter(client, monkeypatch, rea
     assert missing_resp.status_code == 404
 
 
+def test_retts_job_regenerates_with_new_voice(client, monkeypatch, real_video_bytes):
+    """POST /jobs/{id}/retts re-runs only voicing/dubbing/splitting, reusing
+    the job's already-stored transcript+translation and the original video
+    still sitting in UPLOAD_DIR -- Piper must be invoked again with the new
+    voice's model args."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = client.post(
+        "/jobs",
+        files={"video": ("clip.mp4", real_video_bytes, "video/mp4")},
+        data={},
+    )
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["result"]["voice"] == "male"
+    assert len(fake.piper_commands) == 1
+    assert "davefx-medium" in fake.piper_commands[0]
+
+    retts_resp = client.post(f"/jobs/{job_id}/retts", data={"voice": "female"})
+    assert retts_resp.status_code == 200
+    job2 = client.get(f"/jobs/{job_id}").json()
+
+    assert job2["status"] == "done"
+    assert job2["result"]["voice"] == "female"
+    assert len(fake.piper_commands) == 2
+    assert "sharvard-medium" in fake.piper_commands[1]
+    assert "--speaker 1" in fake.piper_commands[1]
+
+
+def test_retts_job_rejects_when_already_running(client):
+    job_id = jobs_module.create_job("clip.mp4")
+    jobs_module.update_job(job_id, status="running", stage="transcribing")
+
+    resp = client.post(f"/jobs/{job_id}/retts", data={"voice": "male"})
+
+    assert resp.status_code == 409
+
+
+def test_retts_job_rejects_when_no_segments_yet(client):
+    job_id = jobs_module.create_job("clip.mp4")
+
+    resp = client.post(f"/jobs/{job_id}/retts", data={"voice": "male"})
+
+    assert resp.status_code == 400
+
+
+def test_retts_chapter_rebuilds_only_that_chapter(client, monkeypatch, real_video_bytes):
+    """POST /jobs/{id}/chapters/{index}/retts must re-synthesize narration
+    only for the segments in that chapter's time window and rebuild only
+    that chapter's clip file, leaving other chapters untouched."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = client.post(
+        "/jobs",
+        files={"video": ("clip.mp4", real_video_bytes, "video/mp4")},
+        data={"chapters_json": json.dumps([{"time": 0, "title": "Intro"}, {"time": 2.5, "title": "Parte 2"}])},
+    )
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["result"]["chapter_clips_available"] is True
+
+    ch0_before = (app_module.VIDEO_DIR / job_id / "chapters" / "00.mp4").read_bytes()
+
+    slice_calls = []
+    real_extract = dub_module.extract_video_slice
+
+    def spy_extract(video_path, start, end, output_path):
+        slice_calls.append((start, end))
+        return real_extract(video_path, start, end, output_path)
+
+    monkeypatch.setattr(app_module.dub, "extract_video_slice", spy_extract)
+
+    retts_resp = client.post(f"/jobs/{job_id}/chapters/1/retts")
+    assert retts_resp.status_code == 200
+    job2 = client.get(f"/jobs/{job_id}").json()
+
+    assert job2["status"] == "done"
+    assert slice_calls == [(2.5, 4.0)]  # only chapter 1's window was rebuilt
+    ch0_after = (app_module.VIDEO_DIR / job_id / "chapters" / "00.mp4").read_bytes()
+    assert ch0_after == ch0_before
+    assert len(fake.piper_commands) == 2  # once for the job, once for the chapter retts
+
+
+def test_retts_chapter_rejects_out_of_range_index(client, monkeypatch):
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = submit(client, chapters=[{"time": 0, "title": "Intro"}])
+    job_id = resp.json()["job_id"]
+
+    retts_resp = client.post(f"/jobs/{job_id}/chapters/5/retts")
+
+    assert retts_resp.status_code == 404
+
+
+def test_chapter_audio_generates_standalone_wav_for_one_chapter(client, monkeypatch):
+    """POST /jobs/{id}/chapters/{index}/audio must synthesize just that
+    chapter's segments into a standalone WAV -- no video slicing/muxing --
+    served back by GET on the same path."""
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = submit(client, chapters=[{"time": 0, "title": "Intro"}, {"time": 2.5, "title": "Parte 2"}])
+    job_id = resp.json()["job_id"]
+    job = client.get(f"/jobs/{job_id}").json()
+    assert job["status"] == "done"
+
+    missing_resp = client.get(f"/jobs/{job_id}/chapters/1/audio")
+    assert missing_resp.status_code == 404
+
+    audio_resp = client.post(f"/jobs/{job_id}/chapters/1/audio")
+    assert audio_resp.status_code == 200
+    job2 = client.get(f"/jobs/{job_id}").json()
+    assert job2["status"] == "done"
+    # Persisted on the job -- not just a file on disk -- so the frontend can
+    # show the player again after a reload/reopen without regenerating it.
+    assert job2["result"]["chapter_audio_indexes"] == [1]
+
+    get_resp = client.get(f"/jobs/{job_id}/chapters/1/audio")
+    assert get_resp.status_code == 200
+    assert get_resp.headers["content-type"] == "audio/wav"
+    assert len(get_resp.content) > 0
+
+    # Chapter 0's audio was never requested -- must still be absent.
+    other_resp = client.get(f"/jobs/{job_id}/chapters/0/audio")
+    assert other_resp.status_code == 404
+
+
+def test_chapter_audio_rejects_out_of_range_index(client, monkeypatch):
+    fake = FakeSSHClient(json_content={"segments": [{"end": 4.0}]})
+    install_fake_remote(monkeypatch, fake)
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: httpx.Response(
+        200, json={"responseData": {"translatedText": "Hola mundo"}},
+    ))
+
+    resp = submit(client, chapters=[{"time": 0, "title": "Intro"}])
+    job_id = resp.json()["job_id"]
+
+    audio_resp = client.post(f"/jobs/{job_id}/chapters/5/audio")
+
+    assert audio_resp.status_code == 404
+
+
 def test_mymemory_failure_falls_back_to_ollama(client, monkeypatch):
     """MyMemory down -> fall back to the local Ollama model. Whisper's own
     --task translate is not usable here: it only translates speech INTO

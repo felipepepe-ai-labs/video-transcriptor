@@ -134,6 +134,77 @@ def _error_message(prefix: str, exc: Exception) -> str:
     return f"{prefix}: {exc}"
 
 
+def _synthesize_narration_track(remote, texts_es, segment_starts, total_duration, work_dir, voice, on_progress=None):
+    segment_wavs = remote.run_tts_batch(texts_es, voice=voice, on_progress=on_progress)
+    return dub.build_narration_track(segment_wavs, segment_starts, total_duration=total_duration, work_dir=work_dir)
+
+
+def _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result):
+    """One segment-per-Piper-clip narration track, timed to each segment's
+    own timestamp (not one continuous pass over the full translated text) --
+    this is what makes muxing onto the video possible in the next stage.
+    Mutates `result` in place; narration/dubbing/splitting are bonuses on
+    top of transcript+translation, so failures here are recorded as
+    `*_error` fields rather than raised."""
+    jobs.update_job(
+        job_id, stage="voicing", progress=0.0,
+        segments_done=0, segments_total=len(segments),
+    )
+
+    def report_tts_progress(done: int, total: int) -> None:
+        jobs.update_job(
+            job_id, segments_done=done, segments_total=total,
+            progress=round(done / total * 100, 1) if total else 0.0,
+        )
+
+    texts_es = [s["text_es"] for s in segments]
+    segment_starts = [ts_to_seconds(s["start"]) for s in segments]
+    work_dir = VIDEO_DIR / job_id / "work"
+
+    narration_track = None
+    try:
+        narration_track = _synthesize_narration_track(
+            remote, texts_es, segment_starts, duration, work_dir, voice, on_progress=report_tts_progress
+        )
+        (AUDIO_DIR / f"{job_id}.wav").write_bytes(narration_track.read_bytes())
+        result["audio_available"] = True
+        result.pop("audio_error", None)
+    except (TTSFailed, dub.DubbingFailed) as e:
+        result["audio_available"] = False
+        result["audio_error"] = str(e)
+
+    result["dubbed_video_available"] = False
+    result.pop("dubbed_video_error", None)
+    result["chapter_clips_available"] = False
+    result.pop("chapter_clips_error", None)
+
+    # ── Dub: mux the narration track onto the original video.
+    if narration_track is not None:
+        jobs.update_job(job_id, stage="dubbing")
+        try:
+            dubbed_path = VIDEO_DIR / job_id / "dubbed.mp4"
+            dub.mux_audio_into_video(local_path, narration_track, dubbed_path)
+            result["dubbed_video_available"] = True
+        except dub.DubbingFailed as e:
+            result["dubbed_video_error"] = str(e)
+
+        # ── Split: cut the dubbed video into one clip per chapter.
+        if result["dubbed_video_available"] and formatted_chapters:
+            jobs.update_job(job_id, stage="splitting")
+            try:
+                dub.split_video_by_chapters(
+                    dubbed_path, formatted_chapters, total_duration=duration,
+                    output_dir=VIDEO_DIR / job_id / "chapters",
+                )
+                result["chapter_clips_available"] = True
+            except dub.DubbingFailed as e:
+                result["chapter_clips_error"] = str(e)
+
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    result["voice"] = voice
+
+
 def run_transcription_job(
     job_id: str, local_path: Path, filename: str, chapters: list[dict], voice: str
 ) -> None:
@@ -198,59 +269,7 @@ def run_transcription_job(
                 "chapter_clips_available": False,
             }
 
-            # ── Narration: one Piper clip per segment, timed to that
-            # segment's own timestamp (not one continuous pass over
-            # full_text_es) -- this is what makes muxing onto the video
-            # possible in the next stage.
-            jobs.update_job(
-                job_id, stage="voicing", progress=0.0,
-                segments_done=0, segments_total=len(segments),
-            )
-
-            def report_tts_progress(done: int, total: int) -> None:
-                jobs.update_job(
-                    job_id, segments_done=done, segments_total=total,
-                    progress=round(done / total * 100, 1) if total else 0.0,
-                )
-
-            narration_track = None
-            try:
-                segment_wavs = remote.run_tts_batch(texts_es, voice=voice, on_progress=report_tts_progress)
-                segment_starts = [ts_to_seconds(s["start"]) for s in segments]
-                work_dir = VIDEO_DIR / job_id / "work"
-                narration_track = dub.build_narration_track(
-                    segment_wavs, segment_starts, total_duration=duration, work_dir=work_dir
-                )
-                (AUDIO_DIR / f"{job_id}.wav").write_bytes(narration_track.read_bytes())
-                result["audio_available"] = True
-            except (TTSFailed, dub.DubbingFailed) as e:
-                # Narration/dubbing are bonuses on top of transcript+
-                # translation -- don't fail a perfectly good job over them.
-                result["audio_error"] = str(e)
-
-            # ── Dub: mux the narration track onto the original video.
-            if narration_track is not None:
-                jobs.update_job(job_id, stage="dubbing")
-                try:
-                    dubbed_path = VIDEO_DIR / job_id / "dubbed.mp4"
-                    dub.mux_audio_into_video(local_path, narration_track, dubbed_path)
-                    result["dubbed_video_available"] = True
-                except dub.DubbingFailed as e:
-                    result["dubbed_video_error"] = str(e)
-
-                # ── Split: cut the dubbed video into one clip per chapter.
-                if result["dubbed_video_available"] and formatted_chapters:
-                    jobs.update_job(job_id, stage="splitting")
-                    try:
-                        dub.split_video_by_chapters(
-                            dubbed_path, formatted_chapters, total_duration=duration,
-                            output_dir=VIDEO_DIR / job_id / "chapters",
-                        )
-                        result["chapter_clips_available"] = True
-                    except dub.DubbingFailed as e:
-                        result["chapter_clips_error"] = str(e)
-
-                shutil.rmtree(work_dir, ignore_errors=True)
+            _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result)
 
             jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
 
@@ -262,6 +281,143 @@ def run_transcription_job(
             jobs.update_job(job_id, status="failed", error=_error_message("500 Transcription failed", e))
         except Exception as e:
             jobs.update_job(job_id, status="failed", error=_error_message("500 Job failed", e))
+    finally:
+        remote.cleanup()
+
+
+def rerun_narration_job(job_id: str, voice: str) -> None:
+    """Re-runs just the voicing/dubbing/splitting stages for an already
+    transcribed+translated job, reusing its stored segments and the
+    original video still sitting in UPLOAD_DIR -- no re-upload, no
+    re-transcribe, no re-translate."""
+    job = jobs.get_job(job_id)
+    result = job["result"]
+    suffix = Path(result["filename"]).suffix or ".mp4"
+    local_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    remote = RemoteWhisper()
+
+    try:
+        try:
+            if not local_path.exists():
+                raise FileNotFoundError("Original video is no longer available locally")
+            remote.connect()
+            _run_narration_and_dub(
+                job_id, remote, local_path, result["duration_seconds"],
+                result["segments"], result.get("chapters", []), voice, result,
+            )
+            jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
+        except RemoteUnavailable as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("502 Remote unavailable", e))
+        except Exception as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("500 Narration re-run failed", e))
+    finally:
+        remote.cleanup()
+
+
+def _chapter_window_and_segments(result: dict, index: int) -> tuple[float, float, list[dict]]:
+    """(start, end, segments) for chapter `index`, per the same
+    nearest-preceding-timestamp convention `assign_chapters` uses."""
+    chapters = result["chapters"]
+    start = chapters[index]["time"]
+    end = chapters[index + 1]["time"] if index + 1 < len(chapters) else result["duration_seconds"]
+    segments = [s for s in result["segments"] if start <= ts_to_seconds(s["start"]) < end]
+    return start, end, segments
+
+
+def rerun_chapter_narration_job(job_id: str, index: int, voice: str) -> None:
+    """Re-synthesizes narration for just one chapter's segments and rebuilds
+    just that chapter's clip -- the full narration track, dubbed video, and
+    other chapter clips are left untouched."""
+    job = jobs.get_job(job_id)
+    result = job["result"]
+    start, end, chapter_segments = _chapter_window_and_segments(result, index)
+
+    suffix = Path(result["filename"]).suffix or ".mp4"
+    local_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    remote = RemoteWhisper()
+
+    try:
+        try:
+            if not local_path.exists():
+                raise FileNotFoundError("Original video is no longer available locally")
+            if not chapter_segments:
+                raise ValueError("No segments found in this chapter")
+            remote.connect()
+
+            texts_es = [s["text_es"] for s in chapter_segments]
+            segment_starts = [ts_to_seconds(s["start"]) - start for s in chapter_segments]
+            work_dir = VIDEO_DIR / job_id / f"work_chapter_{index}"
+
+            def report_tts_progress(done: int, total: int) -> None:
+                jobs.update_job(
+                    job_id, segments_done=done, segments_total=total,
+                    progress=round(done / total * 100, 1) if total else 0.0,
+                )
+
+            jobs.update_job(job_id, segments_done=0, segments_total=len(chapter_segments), progress=0.0)
+            narration_track = _synthesize_narration_track(
+                remote, texts_es, segment_starts, end - start, work_dir, voice, on_progress=report_tts_progress
+            )
+
+            slice_path = work_dir / "slice.mp4"
+            dub.extract_video_slice(local_path, start, end, slice_path)
+            chapter_path = VIDEO_DIR / job_id / "chapters" / f"{index:02d}.mp4"
+            dub.mux_audio_into_video(slice_path, narration_track, chapter_path)
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+            jobs.update_job(job_id, status="done", stage="done", progress=100.0)
+        except RemoteUnavailable as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("502 Remote unavailable", e))
+        except Exception as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("500 Chapter narration re-run failed", e))
+    finally:
+        remote.cleanup()
+
+
+def rerun_chapter_audio_job(job_id: str, index: int, voice: str) -> None:
+    """Synthesizes just the audio (no video mux) for one chapter's segments
+    and saves it as its own WAV -- a quick voice preview that skips the
+    ffmpeg video re-encode entirely."""
+    job = jobs.get_job(job_id)
+    result = job["result"]
+    start, end, chapter_segments = _chapter_window_and_segments(result, index)
+    remote = RemoteWhisper()
+
+    try:
+        try:
+            if not chapter_segments:
+                raise ValueError("No segments found in this chapter")
+            remote.connect()
+
+            texts_es = [s["text_es"] for s in chapter_segments]
+            segment_starts = [ts_to_seconds(s["start"]) - start for s in chapter_segments]
+            work_dir = VIDEO_DIR / job_id / f"work_chapter_audio_{index}"
+
+            def report_tts_progress(done: int, total: int) -> None:
+                jobs.update_job(
+                    job_id, segments_done=done, segments_total=total,
+                    progress=round(done / total * 100, 1) if total else 0.0,
+                )
+
+            jobs.update_job(job_id, segments_done=0, segments_total=len(chapter_segments), progress=0.0)
+            narration_track = _synthesize_narration_track(
+                remote, texts_es, segment_starts, end - start, work_dir, voice, on_progress=report_tts_progress
+            )
+            (AUDIO_DIR / f"{job_id}_ch{index}.wav").write_bytes(narration_track.read_bytes())
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+            # Persisted on the job (like audio_available/chapter_clips_available)
+            # rather than left as frontend-only state, so the player still shows
+            # up after a page reload or reopening the job from history.
+            chapter_audio_indexes = set(result.get("chapter_audio_indexes", []))
+            chapter_audio_indexes.add(index)
+            result["chapter_audio_indexes"] = sorted(chapter_audio_indexes)
+
+            jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
+        except RemoteUnavailable as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("502 Remote unavailable", e))
+        except Exception as e:
+            jobs.update_job(job_id, status="failed", error=_error_message("500 Chapter audio generation failed", e))
     finally:
         remote.cleanup()
 
@@ -321,6 +477,8 @@ async def delete_job(job_id: str):
     if not jobs.delete_job(job_id):
         raise HTTPException(404, "Job not found")
     (AUDIO_DIR / f"{job_id}.wav").unlink(missing_ok=True)
+    for chapter_audio in AUDIO_DIR.glob(f"{job_id}_ch*.wav"):
+        chapter_audio.unlink(missing_ok=True)
     shutil.rmtree(VIDEO_DIR / job_id, ignore_errors=True)
     return {"deleted": job_id}
 
@@ -347,6 +505,87 @@ async def get_job_chapter_video(job_id: str, index: int):
     if not chapter_path.exists():
         raise HTTPException(404, "Chapter clip not available for this job")
     return FileResponse(chapter_path, media_type="video/mp4", filename=f"{job_id}_chapter{index:02d}.mp4")
+
+
+def _require_reranable_job(job_id: str) -> dict:
+    """Shared guard for the two retts routes: job must exist, not already be
+    running, and have a transcript+translation to re-voice."""
+    job = jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    if job["status"] == "running":
+        raise HTTPException(409, "Job is already running")
+    result = job.get("result")
+    if not result or not result.get("segments"):
+        raise HTTPException(400, "Job has no transcript/translation yet")
+    return job
+
+
+@app.post("/jobs/{job_id}/retts")
+async def retts_job(job_id: str, background_tasks: BackgroundTasks, voice: str = Form("male")):
+    """Re-run just the voicing/dubbing/splitting stages for a job that's
+    already been transcribed+translated -- e.g. to try the other voice or
+    retry after a TTS/mux failure, without a full re-transcribe+translate."""
+    _require_reranable_job(job_id)
+    if voice not in ("male", "female"):
+        raise HTTPException(400, "voice must be 'male' or 'female'")
+
+    jobs.update_job(job_id, status="running", stage="voicing", error=None)
+    background_tasks.add_task(rerun_narration_job, job_id, voice)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/jobs/{job_id}/chapters/{index}/retts")
+async def retts_chapter(
+    job_id: str, index: int, background_tasks: BackgroundTasks,
+    voice: Optional[str] = Form(None),
+):
+    """Re-synthesize narration for just one chapter's segments and rebuild
+    just that chapter's clip, leaving the full narration/dubbed video and
+    other chapters untouched."""
+    job = _require_reranable_job(job_id)
+    result = job["result"]
+    chapters = result.get("chapters") or []
+    if index < 0 or index >= len(chapters):
+        raise HTTPException(404, "Chapter not found")
+
+    chosen_voice = voice or result.get("voice", "male")
+    if chosen_voice not in ("male", "female"):
+        raise HTTPException(400, "voice must be 'male' or 'female'")
+
+    jobs.update_job(job_id, status="running", stage="voicing_chapter", error=None)
+    background_tasks.add_task(rerun_chapter_narration_job, job_id, index, chosen_voice)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.post("/jobs/{job_id}/chapters/{index}/audio")
+async def generate_chapter_audio(
+    job_id: str, index: int, background_tasks: BackgroundTasks,
+    voice: Optional[str] = Form(None),
+):
+    """Synthesize just the audio (no video) for one chapter's text --
+    a quick voice preview, skipping the ffmpeg re-encode entirely."""
+    job = _require_reranable_job(job_id)
+    result = job["result"]
+    chapters = result.get("chapters") or []
+    if index < 0 or index >= len(chapters):
+        raise HTTPException(404, "Chapter not found")
+
+    chosen_voice = voice or result.get("voice", "male")
+    if chosen_voice not in ("male", "female"):
+        raise HTTPException(400, "voice must be 'male' or 'female'")
+
+    jobs.update_job(job_id, status="running", stage="voicing_chapter", error=None)
+    background_tasks.add_task(rerun_chapter_audio_job, job_id, index, chosen_voice)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/jobs/{job_id}/chapters/{index}/audio")
+async def get_job_chapter_audio(job_id: str, index: int):
+    audio_path = AUDIO_DIR / f"{job_id}_ch{index}.wav"
+    if not audio_path.exists():
+        raise HTTPException(404, "Audio not available for this chapter")
+    return FileResponse(audio_path, media_type="audio/wav", filename=f"{job_id}_chapter{index:02d}.wav")
 
 
 @app.get("/health")

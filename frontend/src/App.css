@@ -213,6 +213,28 @@ header p {
   background: #e0e7ff;
 }
 
+.chapter-clip-regen {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  background: #eef2ff;
+  border: none;
+  cursor: pointer;
+  font-size: 0.75rem;
+}
+
+.chapter-clip-regen:hover:not(:disabled) {
+  background: #e0e7ff;
+}
+
+.chapter-clip-regen:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ── Dubbed Video ──────────────────────────────────────────────────── */
 
 .dubbed-video {
@@ -261,6 +283,34 @@ header p {
   font-size: 0.75rem;
   font-weight: 500;
   color: #9ca3af;
+}
+
+.chapter-tts-btn {
+  padding: 0.25rem 0.6rem;
+  background: none;
+  border: 1px solid #6366f1;
+  border-radius: 0.4rem;
+  color: #6366f1;
+  cursor: pointer;
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.chapter-tts-btn:hover:not(:disabled) {
+  background: #eef2ff;
+}
+
+.chapter-tts-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.chapter-audio-player {
+  margin: 0 0 0.75rem;
+}
+
+.chapter-audio-player audio {
+  width: 100%;
 }
 
 /* ── Button ────────────────────────────────────────────────────────── */
@@ -482,6 +532,36 @@ header p {
   color: #9ca3af;
 }
 
+/* ── Regenerate Narration ──────────────────────────────────────────── */
+
+.regen-narration {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+  font-size: 0.875rem;
+}
+
+.btn-regen {
+  padding: 0.4rem 0.9rem;
+  background: none;
+  border: 1px solid #6366f1;
+  border-radius: 0.4rem;
+  color: #6366f1;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.btn-regen:hover:not(:disabled) {
+  background: #eef2ff;
+}
+
+.btn-regen:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 /* ── Tabs ──────────────────────────────────────────────────────────── */
 
 .tabs {
@@ -647,12 +727,32 @@ header p {
   .chapter-clip-download:hover {
     background: #3730a3;
   }
+  .chapter-clip-regen {
+    background: #312e81;
+  }
+  .chapter-clip-regen:hover:not(:disabled) {
+    background: #3730a3;
+  }
+  .btn-regen {
+    color: #a5b4fc;
+    border-color: #6366f1;
+  }
+  .btn-regen:hover:not(:disabled) {
+    background: #1e1b4b20;
+  }
   .chapter-heading-ts {
     background: #312e81;
     color: #a5b4fc;
   }
   .chapter-heading-count {
     color: #6b7280;
+  }
+  .chapter-tts-btn {
+    color: #a5b4fc;
+    border-color: #6366f1;
+  }
+  .chapter-tts-btn:hover:not(:disabled) {
+    background: #1e1b4b20;
   }
   .progress-bar {
     background: #374151;

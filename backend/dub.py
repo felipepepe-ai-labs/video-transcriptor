@@ -80,6 +80,20 @@ def mux_audio_into_video(video_path: Path, audio_path: Path, output_path: Path) 
     ])
 
 
+def extract_video_slice(video_path: Path, start: float, end: float, output_path: Path) -> None:
+    """Frame-accurate cut. `-c copy` cannot start a clip anywhere but a
+    keyframe -- on a real encode (GOP well beyond a single chapter's length)
+    a `-ss`/`-to` window with no keyframe inside it produces an output with
+    zero video frames (audio only), which then fails the next stage (muxing
+    narration onto it needs an actual video stream to map). Re-encoding the
+    video stream is the only way to guarantee the cut lands exactly on
+    `start`/`end` regardless of where the source's keyframes are."""
+    _run_ffmpeg([
+        "-i", str(video_path), "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", str(output_path),
+    ])
+
+
 def split_video_by_chapters(
     video_path: Path, chapters: list[dict], total_duration: float, output_dir: Path
 ) -> list[Path]:
@@ -91,6 +105,6 @@ def split_video_by_chapters(
         start = ch["time"]
         end = sorted_chapters[i + 1]["time"] if i + 1 < len(sorted_chapters) else total_duration
         out_path = output_dir / f"{i:02d}.mp4"
-        _run_ffmpeg(["-i", str(video_path), "-ss", f"{start:.3f}", "-to", f"{end:.3f}", "-c", "copy", str(out_path)])
+        extract_video_slice(video_path, start, end, out_path)
         outputs.append(out_path)
     return outputs
