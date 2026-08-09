@@ -32,7 +32,7 @@ class ScrapingError(SyncError):
 
 import json
 import os
-import re
+import shutil
 import time
 from pathlib import Path
 
@@ -75,7 +75,8 @@ def _parse_netscape(text: str) -> list[dict]:
                 "value": value,
                 "httpOnly": http_only.lower() == "true",
                 "secure": secure_str.lower() == "true",
-                "expires": int(expiry) if expiry.isdigit() else None,
+                # Playwright wants -1 for a session cookie, not a null expiry.
+                "expires": int(expiry) if expiry.isdigit() and int(expiry) > 0 else -1,
             }
         )
     return cookies
@@ -132,15 +133,12 @@ def import_cookies(netscape_path: str | Path, data_dir: Path | None = None) -> d
     }
     data_dir.mkdir(parents=True, exist_ok=True)
     session_path.write_text(json.dumps(state), encoding="utf-8")
+    # session.json holds auth_token in clear: as sensitive as the jar itself.
+    os.chmod(str(session_path), 0o600)
 
-    # Also keep a copy of the raw cookies.txt (chmod 0600 for security).
-    with open(cookies_file, "w", encoding="utf-8") as fh:
-        fh.write("# Netscape HTTP Cookie File\n")
-        for c in cookies:
-            flag = "TRUE" if c.get("httpOnly") else "FALSE"
-            secure = "TRUE" if c.get("secure") else "FALSE"
-            expires = int(c["expires"]) if c.get("expires") else 0
-            fh.write(f"# {c['domain']}\t{flag}\t{c['path']}\t{secure}\t{expires}\t{c['name']}\t{c['value']}\n")
+    # yt-dlp reads this jar directly, so keep the export verbatim rather than
+    # re-serialising it — a lossy rewrite silently produces an unusable file.
+    shutil.copyfile(Path(netscape_path), cookies_file)
     os.chmod(str(cookies_file), 0o600)
 
     return {
