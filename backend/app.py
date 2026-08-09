@@ -13,7 +13,14 @@ from fastapi.responses import FileResponse
 import dub
 import jobs
 import youtube
-from x_sync import import_cookies as _import_cookies, ScrapingError, CookieParseError, download_video as _download_video
+from x_sync import (
+    import_cookies as _import_cookies,
+    ScrapingError,
+    CookieParseError,
+    NoMediaFound,
+    DATA_DIR,
+    download_video as _download_video,
+)
 from remote import (
     InsufficientRemoteStorage,
     RemoteUnavailable,
@@ -699,8 +706,6 @@ async def import_x_cookies(file: UploadFile = File(...)):
 async def sync_x_bookmarks(background_tasks: BackgroundTasks):
     """Trigger Playwright headless scraping of X bookmarks. The session must
     have been set up first via POST /x/import-cookies."""
-    from x_sync import DATA_DIR
-
     session_path = DATA_DIR / "session.json"
     if not session_path.exists():
         raise HTTPException(400, "No session found — import cookies first (POST /x/import-cookies)")
@@ -761,6 +766,11 @@ async def download_x_bookmark(id: int, background_tasks: BackgroundTasks):
     if bm is None:
         raise HTTPException(404, "Bookmark not found")
 
+    # Only bookmarks the user actually picked are downloaded. 'no_media' is
+    # included so the UI can retry a tweet yt-dlp found no video in.
+    if bm["status"] not in ("interesting", "no_media"):
+        raise HTTPException(409, f"Cannot download a bookmark with status '{bm['status']}'")
+
     cookies_path = DATA_DIR / "cookies.txt"
     if not cookies_path.exists():
         raise HTTPException(400, "No cookies file — import cookies first")
@@ -771,23 +781,22 @@ async def download_x_bookmark(id: int, background_tasks: BackgroundTasks):
 
 def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> None:
     """Background worker for downloading a bookmark's video."""
+    import x_bookmarks as xb
+
     try:
         file_path = _download_video(tweet_url, cookies_path)
-        import x_bookmarks as xb
-        if file_path:
-            bm_id_int = int(bm_id)
-            # Parse the actual filename from the path.
-            path_obj = Path(file_path)
-            bm_record = xb.get_bookmark(bm_id_int)
-            if bm_record:
-                # Need a connection to update; use module-level init's one.
-                conn = xb._get_conn()
-                try:
-                    xb.mark_downloaded(bm_id_int, str(path_obj), db=conn)
-                finally:
-                    conn.close()
+    except NoMediaFound:
+        # Not a failure: the tweet just isn't a video. Settle it in 'no_media'
+        # so it stops looking like a download still pending.
+        xb.mark_no_media(int(bm_id))
+        return
     except Exception as e:
         print(f"[x-download] Error for bookmark {bm_id}: {e}")  # noqa: T201
+        return
+
+    # db=None so the store owns the commit — passing a connection in leaves the
+    # UPDATE uncommitted and the download is silently lost.
+    xb.mark_downloaded(int(bm_id), file_path)
 
 
 @app.post("/x/bookmarks/{id}/transcribe")

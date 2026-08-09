@@ -207,6 +207,36 @@ def test_set_interesting_reports_failure_for_an_unknown_id(db):
     assert xb.set_interesting(999999, True, db=db) is False
 
 
+def test_mark_no_media_settles_a_bookmark_without_video(db):
+    """A tweet with no video must not stay stuck in 'interesting' forever."""
+    row_id = _insert(db, "https://x.com/a/status/1", status="interesting")
+
+    assert xb.mark_no_media(row_id, db=db) is True
+    assert xb.get_bookmark(row_id, db=db)["status"] == "no_media"
+
+
+def test_mark_no_media_leaves_a_downloaded_bookmark_alone(db):
+    row_id = _insert(db, "https://x.com/a/status/1", status="downloaded")
+
+    assert xb.mark_no_media(row_id, db=db) is False
+    assert xb.get_bookmark(row_id, db=db)["status"] == "downloaded"
+
+
+def test_set_interesting_can_retry_a_no_media_bookmark(db):
+    """no_media is reversible: the user can push it back for another attempt."""
+    row_id = _insert(db, "https://x.com/a/status/1", status="no_media")
+
+    assert xb.set_interesting(row_id, True, db=db) is True
+    assert xb.get_bookmark(row_id, db=db)["status"] == "interesting"
+
+
+def test_set_interesting_can_send_a_no_media_bookmark_back_to_new(db):
+    row_id = _insert(db, "https://x.com/a/status/1", status="no_media")
+
+    assert xb.set_interesting(row_id, False, db=db) is True
+    assert xb.get_bookmark(row_id, db=db)["status"] == "new"
+
+
 def test_mark_downloaded_records_the_local_path(db):
     row_id = _insert(db, "https://x.com/a/status/1", status="interesting")
 

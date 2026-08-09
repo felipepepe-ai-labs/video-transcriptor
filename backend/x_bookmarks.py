@@ -168,14 +168,24 @@ def get_bookmark(db_id: int, db: sqlite3.Connection | None = None) -> dict | Non
     return dict(row) if row else None
 
 
+# Statuses a bookmark may be reviewed from, per target status. 'no_media' is
+# reversible on purpose: a tweet yt-dlp found no video in can be pushed back for
+# another attempt, or dropped back to 'new'. 'downloaded' is terminal.
+_REVIEWABLE_FROM = {
+    "interesting": ("new", "no_media"),
+    "new": ("interesting", "no_media"),
+}
+
+
 def set_interesting(db_id: int, interesting: bool, db: sqlite3.Connection | None = None) -> bool:
-    """Transition new <-> interesting. Returns True on success."""
+    """Transition between new, interesting and no_media. Returns True on success."""
     target = "interesting" if interesting else "new"
+    allowed = _REVIEWABLE_FROM[target]
     conn = _get_conn() if db is None else db
     try:
         cur = conn.execute(
-            "UPDATE bookmarks SET status = ? WHERE id = ? AND status IN ('new', 'interesting')",
-            (target, db_id),
+            f"UPDATE bookmarks SET status = ? WHERE id = ? AND status IN ({', '.join('?' * len(allowed))})",
+            (target, db_id, *allowed),
         )
         if db is None:
             conn.commit()
@@ -200,6 +210,26 @@ def mark_downloaded(db_id: int, file_path: str, db: sqlite3.Connection | None = 
         if db is None:
             conn.commit()
             conn.close()
+        return cur.rowcount > 0
+    finally:
+        if db is None:
+            conn.close()
+
+
+def mark_no_media(db_id: int, db: sqlite3.Connection | None = None) -> bool:
+    """Settle a bookmark yt-dlp found no video in.
+
+    Without this the bookmark stays in 'interesting' forever, indistinguishable
+    from one still waiting to be downloaded.
+    """
+    conn = _get_conn() if db is None else db
+    try:
+        cur = conn.execute(
+            "UPDATE bookmarks SET status = 'no_media' WHERE id = ? AND status IN ('interesting', 'no_media')",
+            (db_id,),
+        )
+        if db is None:
+            conn.commit()
         return cur.rowcount > 0
     finally:
         if db is None:

@@ -996,6 +996,8 @@ header p {
 .status-badge.new { background: #dbeafe; color: #1d4ed8; }
 .status-badge.interesting { background: #fef3c7; color: #b45309; }
 .status-badge.downloaded { background: #d1fae5; color: #065f46; }
+/* Neutral, not red: a tweet without video is an outcome, not an error. */
+.status-badge.no-media { background: #f1f5f9; color: #475569; }
 
 .bookmark-actions {
   display: flex;
@@ -1029,4 +1031,5 @@ header p {
   .status-badge.new { background: #1e3a5f; color: #93c5fd; }
   .status-badge.interesting { background: #451a03; color: #fbbf24; }
   .status-badge.downloaded { background: #064e3b; color: #6ee7b7; }
+  .status-badge.no-media { background: #334155; color: #cbd5e1; }
 }

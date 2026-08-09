@@ -7,17 +7,32 @@ const STATUS_FILTERS = [
   { label: "Nuevos", value: "new" },
   { label: "Interesantes", value: "interesting" },
   { label: "Descargados", value: "downloaded" },
+  { label: "Sin video", value: "no_media" },
 ]
+
+const STATUS_LABELS = {
+  new: "nuevo",
+  interesting: "interesante",
+  downloaded: "descargado",
+  no_media: "sin video",
+}
+
+// Statuses the backend accepts a download for; no_media is retryable.
+const DOWNLOADABLE = ["interesting", "no_media"]
 
 function statusClass(status) {
   if (status === "downloaded") return "downloaded"
   if (status === "interesting") return "interesting"
+  if (status === "no_media") return "no-media"
   return "new"
 }
 
-function formatDate(unix) {
-  if (!unix) return ""
-  return new Date(unix * 1000).toLocaleDateString("es-AR", {
+function formatDate(scrapedAt) {
+  if (!scrapedAt) return ""
+  // scraped_at is an ISO-8601 string from the backend, not a unix timestamp.
+  const date = new Date(scrapedAt)
+  if (Number.isNaN(date.getTime())) return ""
+  return date.toLocaleDateString("es-AR", {
     day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
   })
 }
@@ -32,14 +47,16 @@ function XBookmarks() {
   const [syncMessage, setSyncMessage] = useState("")
   const fileInputRef = useRef(null)
 
+  // Refetch whenever the filter changes: calling refreshBookmarks() straight
+  // after setStatusFilter() would still read the previous filter value.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { refreshBookmarks() }, [])
+  useEffect(() => { refreshBookmarks() }, [statusFilter])
 
   async function refreshBookmarks() {
     setLoading(true)
     setError("")
     try {
-      const url = `${API_URL}/x/bookmarks${statusFilter ? `?status_filter=${statusFilter}` : ""}`
+      const url = `${API_URL}/x/bookmarks${statusFilter ? `?status=${statusFilter}` : ""}`
       const res = await fetch(url)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       setBookmarks(await res.json())
@@ -157,7 +174,7 @@ function XBookmarks() {
             role="tab"
             aria-selected={statusFilter === f.value}
             className={statusFilter === f.value ? "active" : ""}
-            onClick={() => { setStatusFilter(f.value); refreshBookmarks() }}
+            onClick={() => setStatusFilter(f.value)}
           >
             {f.label}
           </button>
@@ -193,7 +210,7 @@ function XBookmarks() {
               </div>
               <div className="bookmark-footer">
                 <span className={`status-badge ${statusClass(bm.status)}`}>
-                  {bm.status}
+                  {STATUS_LABELS[bm.status] ?? bm.status}
                 </span>
                 <div className="bookmark-actions">
                   <button
@@ -203,14 +220,14 @@ function XBookmarks() {
                   >
                     {bm.status === "interesting" ? "⭐" : "☆"}
                   </button>
-                  {bm.status !== "downloaded" && (
+                  {DOWNLOADABLE.includes(bm.status) && (
                     <button
-                      title="Descargar video"
+                      title={bm.status === "no_media" ? "Reintentar descarga" : "Descargar video"}
                       disabled={downloadingIds.has(bm.id)}
                       onClick={() => downloadBookmark(bm.id, bm.tweet_url)}
-                      aria-label="Descargar"
+                      aria-label={bm.status === "no_media" ? "Reintentar descarga" : "Descargar"}
                     >
-                      {downloadingIds.has(bm.id) ? "⏳" : "⬇️"}
+                      {downloadingIds.has(bm.id) ? "⏳" : bm.status === "no_media" ? "🔁" : "⬇️"}
                     </button>
                   )}
                   <button

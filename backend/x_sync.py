@@ -28,10 +28,24 @@ class ScrapingError(SyncError):
     """Headless browser failed to collect bookmarks."""
 
 
+class DownloadFailed(SyncError):
+    """yt-dlp could not download a bookmark's video."""
+
+
+class NoMediaFound(SyncError):
+    """The tweet simply has no video.
+
+    Deliberately not a DownloadFailed: not every bookmark is a video, so this is
+    an ordinary outcome that settles the bookmark in 'no_media' rather than an
+    error the user has to fix.
+    """
+
+
 # ── Imports ──
 
 import json
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -270,11 +284,8 @@ def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
     ScrapingError
         If Playwright crashes, the session is invalid, or no tweets are found.
     """
-    try:
-        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise ScrapingError("playwright is not installed; run: pip install playwright && playwright install chromium") from exc
-
+    # Validate the session before reaching for playwright: needing a browser
+    # installed just to be told the cookies were never imported is unhelpful.
     session_path = Path(session_path)
     if not session_path.exists():
         raise ScrapingError(f"session file not found: {session_path}")
@@ -282,6 +293,11 @@ def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
     storage_state = json.loads(session_path.read_text())
     if not storage_state.get("cookies"):
         raise ScrapingError("session has no cookies — import cookies first")
+
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ScrapingError("playwright is not installed; run: pip install playwright && playwright install chromium") from exc
 
     results: list[dict] = []
     with sync_playwright() as pw:
@@ -328,17 +344,24 @@ def download_video(
 ) -> str:
     """Download a video from the given tweet using yt-dlp.
 
-    Returns the path to the downloaded file, or ``""`` on failure (non-video tweets
-    are detected and reported back with ``status=no_media``).
+    Returns the path to the downloaded file.
 
-    Mirrors the curator's spawn-based approach (subprocess + stderr parsing) for
-    feature parity: progress prefix, ``no_media`` detection, etc.
+    Raises
+    ------
+    NoMediaFound
+        The tweet has no video — an ordinary outcome, not an error.
+    DownloadFailed
+        yt-dlp failed, or reported success without writing anything.
     """
     dest_dir = dest_dir or DATA_DIR / "downloads"
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # Use yt-dlp directly (already a dependency of the app).
     import subprocess  # noqa: F811 (late import to avoid cold-start cost)
+
+    # Snapshot the directory so we can tell which file *this* call produced,
+    # rather than handing back an unrelated earlier download.
+    before = set(dest_dir.iterdir())
 
     cmd = [
         "yt-dlp",
@@ -356,13 +379,22 @@ def download_video(
         timeout=300,  # 5 min max per download.
     )
 
-    stderr_lower = (proc.stderr or "").lower()
-    if "no media" in stderr_lower or "missing" in stderr_lower or proc.returncode != 0:
-        return ""
+    stderr = proc.stderr or ""
+    # Same test as the curator's download.js: only these two phrasings mean
+    # "this tweet is not a video". A generic 'missing' is a real failure.
+    if re.search(r"no video|no media found", stderr, re.IGNORECASE):
+        raise NoMediaFound(f"no video in {tweet_url}")
+    if proc.returncode != 0:
+        raise DownloadFailed(f"yt-dlp exited {proc.returncode}: {stderr.strip()[:500]}")
 
-    # Find the actual file that was written.
-    for ext in (".mp4", ".mkv", ".webm"):
-        for p in dest_dir.iterdir():
-            if p.suffix == ext and not str(p).startswith(".") and p.stat().st_size > 0:
-                return str(p)
-    return ""
+    written = [
+        p
+        for p in dest_dir.iterdir()
+        if p not in before
+        and p.suffix in (".mp4", ".mkv", ".webm")
+        and p.stat().st_size > 0
+    ]
+    if not written:
+        raise DownloadFailed(f"yt-dlp reported success but wrote no file for {tweet_url}")
+
+    return str(max(written, key=lambda p: p.stat().st_mtime))
