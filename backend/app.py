@@ -13,6 +13,7 @@ from fastapi.responses import FileResponse
 import dub
 import jobs
 import youtube
+from x_sync import import_cookies as _import_cookies, ScrapingError, CookieParseError, download_video as _download_video
 from remote import (
     InsufficientRemoteStorage,
     RemoteUnavailable,
@@ -285,8 +286,7 @@ def run_transcription_job(
                 "chapter_clips_available": False,
             }
 
-            if not spanish_source:
-                _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result)
+            _run_narration_and_dub(job_id, remote, local_path, duration, segments, formatted_chapters, voice, result)
 
             jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
 
@@ -671,6 +671,187 @@ async def health():
         "remote_host": os.getenv("REMOTE_HOST", "192.168.1.60"),
         "device": os.getenv("REMOTE_DEVICE", "cuda"),
     }
+
+
+# ── X (Twitter) Bookmarks routes ───────────────────────────────────────
+
+@app.post("/x/import-cookies")
+async def import_x_cookies(file: UploadFile = File(...)):
+    """Upload a Netscape-format cookies.txt file. Validates that the required
+    X authentication cookies (auth_token, ct0, twid) are present, then writes
+    a Playwright sessionState JSON + cookies.txt (chmod 0600) to data/x-bookmarks/."""
+    import tempfile
+    tmp = Path(tempfile.mkdtemp()) / "cookies.upload"
+    with open(str(tmp), "wb") as f:
+        shutil.copyfileobj(file.file, f, length=1048576)
+
+    try:
+        result = _import_cookies(str(tmp))
+    except CookieParseError as e:
+        raise HTTPException(400, str(e))
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    return {"ok": True, "message": "Cookies imported", "found": result["found_cookies"]}
+
+
+@app.post("/x/sync")
+async def sync_x_bookmarks(background_tasks: BackgroundTasks):
+    """Trigger Playwright headless scraping of X bookmarks. The session must
+    have been set up first via POST /x/import-cookies."""
+    from x_sync import DATA_DIR
+
+    session_path = DATA_DIR / "session.json"
+    if not session_path.exists():
+        raise HTTPException(400, "No session found — import cookies first (POST /x/import-cookies)")
+
+    background_tasks.add_task(_sync_x_bookmarks_worker, str(session_path))
+    return {"ok": True, "message": "Sync started"}
+
+
+def _sync_x_bookmarks_worker(session_path: str) -> None:
+    """Background worker for X bookmark sync."""
+    try:
+        from x_sync import sync_x_bookmarks, ScrapingError
+        import x_bookmarks as xb
+        sync_x_bookmarks(session_path, db=None)
+    except ScrapingError as e:
+        # Log the error (in production you'd wire this to a real logger).
+        print(f"[x-sync] Error: {e}")  # noqa: T201
+
+
+@app.get("/x/bookmarks")
+async def list_x_bookmarks(status: str | None = None):
+    """List all X bookmarks. Optionally filter by status (new, interesting, downloaded)."""
+    import x_bookmarks as xb
+    return xb.list_bookmarks(status_filter=status)
+
+
+@app.patch("/x/bookmarks/{id}/interesting")
+async def toggle_interesting(id: int):
+    """Toggle a bookmark's status between 'new' and 'interesting'."""
+    import x_bookmarks as xb
+    bm = xb.get_bookmark(id)
+    if bm is None:
+        raise HTTPException(404, "Bookmark not found")
+
+    target = "interesting" if bm["status"] == "new" else "new"
+    ok = xb.set_interesting(id, interesting=(target == "interesting"))
+    if not ok:
+        raise HTTPException(409, f"Cannot transition from '{bm['status']}' to '{target}'")
+    return {"ok": True, "status": target}
+
+
+@app.delete("/x/bookmarks/{id}")
+async def delete_x_bookmark(id: int):
+    """Delete a bookmark record (and its local file if present)."""
+    import x_bookmarks as xb
+    ok = xb.delete_bookmark(id)
+    if not ok:
+        raise HTTPException(404, "Bookmark not found")
+    return {"deleted": id}
+
+
+@app.post("/x/bookmarks/{id}/download")
+async def download_x_bookmark(id: int, background_tasks: BackgroundTasks):
+    """Download the video from a tweet (if it has one) using yt-dlp. The
+    bookmarks' cookies.txt must be installed first."""
+    import x_bookmarks as xb
+    bm = xb.get_bookmark(id)
+    if bm is None:
+        raise HTTPException(404, "Bookmark not found")
+
+    cookies_path = DATA_DIR / "cookies.txt"
+    if not cookies_path.exists():
+        raise HTTPException(400, "No cookies file — import cookies first")
+
+    background_tasks.add_task(_download_bookmark_worker, id, bm["tweet_url"], str(cookies_path))
+    return {"ok": True, "message": "Download started"}
+
+
+def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> None:
+    """Background worker for downloading a bookmark's video."""
+    try:
+        file_path = _download_video(tweet_url, cookies_path)
+        import x_bookmarks as xb
+        if file_path:
+            bm_id_int = int(bm_id)
+            # Parse the actual filename from the path.
+            path_obj = Path(file_path)
+            bm_record = xb.get_bookmark(bm_id_int)
+            if bm_record:
+                # Need a connection to update; use module-level init's one.
+                conn = xb._get_conn()
+                try:
+                    xb.mark_downloaded(bm_id_int, str(path_obj), db=conn)
+                finally:
+                    conn.close()
+    except Exception as e:
+        print(f"[x-download] Error for bookmark {bm_id}: {e}")  # noqa: T201
+
+
+@app.post("/x/bookmarks/{id}/transcribe")
+async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks):
+    """Trigger SSH Whisper transcription for a downloaded bookmark video.
+    Requires the remote Whisper server to be configured (same env vars as main jobs)."""
+    import x_bookmarks as xb
+    bm = xb.get_bookmark(id)
+    if bm is None:
+        raise HTTPException(404, "Bookmark not found")
+    if not bm.get("local_file_path"):
+        raise HTTPException(400, "No local video file — download first")
+
+    background_tasks.add_task(_transcribe_bookmark_worker, id, bm["local_file_path"])
+    return {"ok": True, "message": "Transcription started"}
+
+
+def _transcribe_bookmark_worker(bm_id: int, video_path: str) -> None:
+    """Background worker for transcribing a bookmark's downloaded video via remote Whisper."""
+    try:
+        # Use the same RemoteWhisper pipeline as regular jobs.
+        remote = RemoteWhisper()
+        remote.connect()
+
+        srt_content, duration, lang = remote.run_transcribe(language=None)  # auto-detect
+
+        segments = parse_srt(srt_content)
+
+        conn = xb._get_conn()
+        try:
+            with xb._lock:
+                conn.execute(
+                    "UPDATE bookmarks SET transcription_status=?, transcript_language=?, transcribed_at=? WHERE id=?",
+                    ("done", lang, time.strftime("%Y-%m-%dT%H:%M:%SZ"), bm_id),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+        # Translate segments to Spanish using the existing pipeline.
+        texts_en = [s["text_en"] for s in segments]
+
+        def report_translation_progress(done: int, total: int) -> None:
+            pass  # no DB update needed for background worker
+
+        texts_es, provider = translate_with_fallback(texts_en, on_progress=report_translation_progress)
+        for seg, text_en, text_es in zip(segments, texts_en, texts_es):
+            seg["text_es"] = text_es
+
+        full_es = "\n".join(s["text_es"] for s in segments)
+
+        conn2 = xb._get_conn()
+        try:
+            with xb._lock:
+                conn2.execute(
+                    "UPDATE bookmarks SET transcript_original=?, full_text_es=?, translation_provider=? WHERE id=?",
+                    ("\n".join(s["text_en"] for s in segments), full_es, provider, bm_id),
+                )
+                conn2.commit()
+        finally:
+            conn2.close()
+
+    except Exception as e:
+        print(f"[x-transcribe] Error for bookmark {bm_id}: {e}")  # noqa: T201
 
 
 if __name__ == "__main__":

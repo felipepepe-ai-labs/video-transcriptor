@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import "./App.css"
+import XBookmarks from "./XBookmarks.jsx"
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 const POLL_INTERVAL_MS = 2000
@@ -24,7 +25,7 @@ const STATUS_ICONS = {
 }
 
 function App() {
-  const [inputMode, setInputMode] = useState("file") // "file" | "youtube"
+  const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "x"
   const [youtubeUrl, setYoutubeUrl] = useState("")
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -41,6 +42,7 @@ function App() {
   const [regenVoice, setRegenVoice] = useState("male")
   const [chapterAudioReady, setChapterAudioReady] = useState({}) // { [chapterIndex]: true }
   const [chapterAudioLoading, setChapterAudioLoading] = useState(null) // chapterIndex currently generating, or null
+  const [playingChapterVideo, setPlayingChapterVideo] = useState(null) // chapterIndex playing inline video, or null
   const pollRef = useRef(null)
 
   useEffect(() => {
@@ -261,7 +263,7 @@ function App() {
   }
 
   function addChapter() {
-    setChapters([...chapters, { id: crypto.randomUUID(), time: "", title: "" }])
+    setChapters([...chapters, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`, time: "", title: "" }])
   }
 
   function updateChapter(id, field, value) {
@@ -318,6 +320,15 @@ function App() {
             onClick={() => setInputMode("youtube")}
           >
             ▶️ YouTube
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "x"}
+            className={inputMode === "x" ? "active" : ""}
+            onClick={() => setInputMode("x")}
+          >
+            🐦 X
           </button>
         </div>
 
@@ -474,6 +485,9 @@ function App() {
         {error && <div className="error-banner">❌ {error}</div>}
       </section>
 
+      {/* X Bookmarks panel */}
+      {inputMode === "x" && <XBookmarks />}
+
       {/* History */}
       {history.length > 0 && (
         <section className="history-section">
@@ -557,7 +571,6 @@ function App() {
           )}
 
           {/* Regenerate narration (whole job) */}
-          {!spanishSource && (
           <div className="regen-narration">
             <label className="voice-option">
               <input
@@ -588,7 +601,6 @@ function App() {
               🔁 Regenerar locución
             </button>
           </div>
-          )}
 
           {/* Chapter jump nav + per-chapter clip download */}
           {result.chapters?.length > 0 && (
@@ -599,28 +611,40 @@ function App() {
                     <span className="pill-ts">{ch.timestamp}</span> {ch.title}
                   </a>
                   {result.chapter_clips_available && job?.id && (
-                    <a
-                      className="chapter-clip-download"
-                      href={`${API_URL}/jobs/${job.id}/chapters/${i}/video`}
-                      download={`${result.filename}.${ch.title}.mp4`}
-                      title="Descargar este capítulo como video"
-                      aria-label={`Descargar capítulo ${ch.title}`}
-                    >
-                      ⬇️
-                    </a>
+                    <>
+                      <button
+                        type="button"
+                        className="chapter-clip-play"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          setPlayingChapterVideo(playingChapterVideo === i ? null : i);
+                        }}
+                        title={playingChapterVideo === i ? "Detener reproducción" : "Reproducir capítulo"}
+                        aria-label={playingChapterVideo === i ? `Detener ${ch.title}` : `Reproducir ${ch.title}`}
+                      >
+                        {playingChapterVideo === i ? "⏸️" : "▶️"}
+                      </button>
+                      <a
+                        className="chapter-clip-download"
+                        href={`${API_URL}/jobs/${job.id}/chapters/${i}/video`}
+                        download={`${result.filename}.${ch.title}.mp4`}
+                        title="Descargar este capítulo como video"
+                        aria-label={`Descargar capítulo ${ch.title}`}
+                      >
+                        ⬇️
+                      </a>
+                    </>
                   )}
-                  {!spanishSource && (
-                    <button
-                      type="button"
-                      className="chapter-clip-regen"
-                      disabled={loading}
-                      onClick={() => regenerateChapter(i)}
-                      title="Regenerar la locución de este capítulo"
-                      aria-label={`Regenerar locución del capítulo ${ch.title}`}
-                    >
-                      🔁
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    className="chapter-clip-regen"
+                    disabled={loading}
+                    onClick={() => regenerateChapter(i)}
+                    title="Regenerar la locución de este capítulo"
+                    aria-label={`Regenerar locución del capítulo ${ch.title}`}
+                  >
+                    🔁
+                  </button>
                 </span>
               ))}
             </nav>
@@ -652,23 +676,39 @@ function App() {
           {groups.map((group, gi) =>
             group.title ? (
               <div key={gi}>
-                <details className="chapter-block" id={group.id} open={gi === 0 || groups.length <= 3}>
+                <details
+                  className="chapter-block"
+                  id={group.id}
+                  open={gi === 0 || groups.length <= 3}
+                  onToggle={(e) => {
+                    if (!e.target.open && playingChapterVideo === group.chapterIndex) {
+                      setPlayingChapterVideo(null);
+                    }
+                  }}
+                >
                   <summary className="chapter-heading">
                     <span className="chapter-heading-ts">{group.timestamp}</span>
                     {group.title}
                     <span className="chapter-heading-count">{group.segments.length}</span>
-                    {!spanishSource && (
-                      <button
-                        type="button"
-                        className="chapter-tts-btn"
-                        disabled={loading}
-                        onClick={(e) => { e.preventDefault(); e.stopPropagation(); generateChapterAudio(group.chapterIndex) }}
-                        title="Generar audio de este capítulo"
-                      >
-                        {chapterAudioLoading === group.chapterIndex ? "⏳" : "🔊"} Generar audio
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      className="chapter-tts-btn"
+                      disabled={loading}
+                      onClick={(e) => { e.preventDefault(); e.stopPropagation(); generateChapterAudio(group.chapterIndex) }}
+                      title="Generar audio de este capítulo"
+                    >
+                      {chapterAudioLoading === group.chapterIndex ? "⏳" : "🔊"} Generar audio
+                    </button>
                   </summary>
+                  {playingChapterVideo === group.chapterIndex && result.chapter_clips_available && job?.id && (
+                    <div className="chapter-video-player">
+                      <video
+                        controls
+                        src={`${API_URL}/jobs/${job.id}/chapters/${group.chapterIndex}/video`}
+                        onEnded={() => setPlayingChapterVideo(null)}
+                      />
+                    </div>
+                  )}
                   <div className="segments">
                     {group.segments.map((seg) => (
                       <div key={seg.index} className="segment-row">
@@ -757,13 +797,14 @@ function App() {
 /* ── Utilities ─────────────────────────────────────────────────────── */
 
 function formatTs(ts) {
-  // "00:00:01.234" → "01.2s"
+  // "00:00:01.234" → "1.2s", "00:05:30.123" → "5m 30s", "01:02:03.456" → "1h 2m"
   const parts = ts.split(":")
   const sec = parseFloat(parts[2] || "0")
   const m = parseInt(parts[0] || "0", 10)
   const s = parseInt(parts[1] || "0", 10)
-  if (m === 0 && s < 60) return `${sec.toFixed(1)}s`
-  return `${m}m ${s}s`
+  if (m === 0 && s === 0) return `${sec.toFixed(1)}s`
+  if (m > 0) return `${m}h ${s}m`
+  return `${s}m ${Math.floor(sec)}s`
 }
 
 function parseTimeToSeconds(input) {
