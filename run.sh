@@ -29,7 +29,7 @@ trap cleanup EXIT INT TERM
 (cd "$BACKEND_DIR" && source "$VENV_DIR/bin/activate" && python app.py) &
 BACKEND_PID=$!
 
-(cd "$FRONTEND_DIR" && npm run dev) &
+(cd "$FRONTEND_DIR" && npm run dev --host) &
 FRONTEND_PID=$!
 
 echo "Backend (PID $BACKEND_PID) → http://localhost:8000"
