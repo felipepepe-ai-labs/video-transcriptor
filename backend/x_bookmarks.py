@@ -122,16 +122,16 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
             "has_media": bool(b.get("has_media")),
             "expanded_text": b.get("expanded_text"),
             "article_content": b.get("article_content"),
+            "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         if not row["tweet_url"]:
             continue
         cols = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
-        values = list(row.values())
         # INSERT OR IGNORE skips duplicates; we never update scraped fields.
         conn.execute(
             f"INSERT OR IGNORE INTO bookmarks ({cols}) VALUES ({placeholders})",
-            values + [time.strftime("%Y-%m-%dT%H:%M:%SZ")],  # scraped_at
+            list(row.values()),
         )
     conn.commit()
     after = conn.execute("SELECT count(*) FROM bookmarks").fetchone()[0]
@@ -236,8 +236,14 @@ def mark_transcribed(db_id: int, status: str, language: str | None = None, trans
         cur = conn.execute(
             "UPDATE bookmarks SET transcription_status = ?, transcribed_at = ?"
             + (", transcript_language = ?" if language else "")
-            + (", transcript_original = ?" if transcript else ""),
-            tuple([status, now] + ([language] if language else []) + ([transcript] if transcript else [])),
+            + (", transcript_original = ?" if transcript else "")
+            + " WHERE id = ?",
+            tuple(
+                [status, now]
+                + ([language] if language else [])
+                + ([transcript] if transcript else [])
+                + [db_id]
+            ),
         )
         if db is None:
             conn.commit()
