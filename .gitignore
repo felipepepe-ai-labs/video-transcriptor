@@ -8,6 +8,10 @@ backend/uploads/
 backend/audio/
 backend/video/
 
+# X bookmarks: local store and the X session credentials written by x_sync.py
+backend/x_bookmarks.db
+backend/data/
+
 # Frontend (has its own frontend/.gitignore for node_modules/dist/etc.)
 
 # Local environment / tooling
