@@ -229,6 +229,125 @@ def test_scroll_without_a_reporter_behaves_exactly_as_before(instant_scroll):
 
 
 # ---------------------------------------------------------------------------
+# Cookie consent banner
+# ---------------------------------------------------------------------------
+
+class FakeLocator:
+    """Playwright's locator, reduced to what dismissing the banner needs."""
+
+    def __init__(self, page, matches):
+        self._page = page
+        self._matches = matches
+
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return len(self._matches)
+
+    def wait_for(self, timeout=None):
+        if not self._matches:
+            raise TimeoutError("locator resolved to no element")
+
+    def click(self, timeout=None):
+        if not self._matches:
+            raise TimeoutError("locator resolved to no element")
+        self._page.clicked.append(self._matches[0])
+
+
+class BannerPage:
+    """A page whose banner button matches (or doesn't) the text regex."""
+
+    def __init__(self, button_texts=()):
+        self.button_texts = list(button_texts)
+        self.clicked = []
+
+    def get_by_text(self, pattern):
+        return FakeLocator(self, [t for t in self.button_texts if pattern.search(t)])
+
+
+def test_dismisses_the_consent_banner_when_it_is_there():
+    """X's GDPR dialog blocks the timeline from hydrating; it must be closed."""
+    page = BannerPage(["Aceptar todas las cookies"])
+
+    assert x_sync._dismiss_cookie_banner(page) is True
+    assert page.clicked == ["Aceptar todas las cookies"]
+
+
+def test_reports_no_banner_without_raising():
+    """X doesn't show it in every region, and that is not a failure."""
+    page = BannerPage([])
+
+    assert x_sync._dismiss_cookie_banner(page) is False
+
+
+def test_prefers_refusing_cookies_over_accepting_them():
+    """Closing the dialog is the goal; there's no reason to opt into tracking."""
+    page = BannerPage(["Aceptar todas las cookies", "Rechazar cookies no necesarias"])
+
+    x_sync._dismiss_cookie_banner(page)
+
+    assert page.clicked == ["Rechazar cookies no necesarias"]
+
+
+def test_dismisses_an_english_banner_too():
+    """The banner follows the account locale, and carries no testid to match on."""
+    page = BannerPage(["Refuse non-essential cookies"])
+
+    assert x_sync._dismiss_cookie_banner(page) is True
+
+
+# ---------------------------------------------------------------------------
+# Waiting for the timeline while the banner races it
+# ---------------------------------------------------------------------------
+
+class TimelinePage(BannerPage):
+    """A page whose timeline appears only after `appears_on_round` waits.
+
+    Models the real race: X's consent banner can surface seconds after load, so
+    a single dismissal attempt made too early simply misses it.
+    """
+
+    def __init__(self, appears_on_round, button_texts=()):
+        super().__init__(button_texts)
+        self.appears_on_round = appears_on_round
+        self.waits = 0
+
+    def wait_for_selector(self, selector, timeout=None):
+        self.waits += 1
+        if self.waits < self.appears_on_round:
+            raise TimeoutError(f"Timeout {timeout}ms exceeded waiting for {selector}")
+        return object()
+
+
+def test_returns_as_soon_as_the_timeline_is_there():
+    page = TimelinePage(appears_on_round=1)
+
+    x_sync._await_timeline(page)
+
+    assert page.waits == 1
+    assert page.clicked == []  # no banner in the way, nothing to dismiss
+
+
+def test_keeps_dismissing_the_banner_while_waiting():
+    """The banner can show up late; one early attempt races it and loses."""
+    page = TimelinePage(appears_on_round=3, button_texts=["Accept all cookies"])
+
+    x_sync._await_timeline(page)
+
+    assert page.waits == 3
+    assert page.clicked  # it kept trying instead of giving up after round one
+
+
+def test_raises_when_the_timeline_never_arrives():
+    page = TimelinePage(appears_on_round=999)
+
+    with pytest.raises(TimeoutError):
+        x_sync._await_timeline(page)
+
+
+# ---------------------------------------------------------------------------
 # Failure diagnosis
 # ---------------------------------------------------------------------------
 

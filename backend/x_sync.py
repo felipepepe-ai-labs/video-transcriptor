@@ -224,6 +224,70 @@ def _extract_tweets(page) -> list[dict]:
     """)
 
 
+# X's GDPR dialog carries no data-testid and follows the account locale, so its
+# visible text is the only handle there is. Refusing comes first: closing the
+# dialog is all the scrape needs, and there's no reason to opt into tracking.
+_CONSENT_BUTTON_TEXTS = (
+    "Rechazar cookies no necesarias",
+    "Refuse non-essential cookies",
+    "Aceptar todas las cookies",
+    "Accept all cookies",
+)
+_CONSENT_TIMEOUT_MS = 3_000
+
+# The timeline is polled in short rounds rather than waited on once, so the
+# banner can be dismissed whenever it decides to show up.
+_TIMELINE_ROUNDS = 10
+_TIMELINE_ROUND_MS = 2_000
+
+
+def _dismiss_cookie_banner(page) -> bool:
+    """Close X's cookie consent dialog, which blocks the timeline from hydrating.
+
+    Only one label can match a given locale, so each candidate is checked with
+    ``count()`` before clicking: probing blind would spend the click timeout on
+    three candidates that will never exist.
+
+    Returns whether a banner was dismissed. Its absence is normal — X doesn't
+    show it in every region, nor once a consent cookie exists — so it is never
+    an error, and failures here are swallowed: the scrape is better off trying
+    the timeline than dying on the doorstep.
+    """
+    for text in _CONSENT_BUTTON_TEXTS:
+        locator = page.get_by_text(re.compile(re.escape(text), re.I))
+        try:
+            if not locator.count():
+                continue
+            locator.first.click(timeout=_CONSENT_TIMEOUT_MS)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _await_timeline(page) -> None:
+    """Wait for the bookmarks timeline, dismissing the consent banner as needed.
+
+    The banner surfaces at an unpredictable moment — measured against x.com, it
+    was still absent 4s after load on two of three tries — so dismissing it once
+    up front races it and loses. Retrying between short waits absorbs that, and
+    costs nothing extra when the timeline shows up first.
+
+    Raises the underlying timeout when the timeline never arrives, so the caller
+    can still tell an expired session from a markup change.
+    """
+    last_error: Exception | None = None
+    for _round in range(_TIMELINE_ROUNDS):
+        try:
+            page.wait_for_selector("[data-testid='tweet']", timeout=_TIMELINE_ROUND_MS)
+            return
+        except Exception as exc:
+            last_error = exc
+            _dismiss_cookie_banner(page)
+
+    raise last_error
+
+
 def _watch_for_auth_failure(page) -> list[int]:
     """Record failed X API responses, so a dead session can be named as such.
 
@@ -368,8 +432,9 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
         try:
             page.goto("https://x.com/i/bookmarks", wait_until="domcontentloaded", timeout=30_000)
 
-            # Wait for the bookmarks list container to appear.
-            page.wait_for_selector("[data-testid='tweet']", timeout=15_000)
+            # Wait for the bookmarks list container, clearing the consent dialog
+            # if it appears: while that dialog is up the timeline never hydrates.
+            _await_timeline(page)
 
             if on_progress:
                 on_progress(message="Bookmarks cargados, recorriendo la lista…")
