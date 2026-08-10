@@ -226,3 +226,51 @@ def test_scroll_without_a_reporter_behaves_exactly_as_before(instant_scroll):
 
     assert x_sync._scroll_until_stable(page) is True
     assert page.scrolls == 4
+
+
+# ---------------------------------------------------------------------------
+# Failure diagnosis
+# ---------------------------------------------------------------------------
+
+def test_auth_watcher_records_only_failed_graphql_responses():
+    class FakeResponse:
+        def __init__(self, status, url):
+            self.status, self.url = status, url
+
+    class HookPage:
+        def __init__(self):
+            self.handler = None
+
+        def on(self, event, handler):
+            assert event == "response"
+            self.handler = handler
+
+    page = HookPage()
+    unauthorized = x_sync._watch_for_auth_failure(page)
+
+    page.handler(FakeResponse(401, "https://api.x.com/graphql/abc/Bookmarks"))
+    page.handler(FakeResponse(200, "https://api.x.com/graphql/abc/HomeTimeline"))
+    page.handler(FakeResponse(404, "https://abs.twimg.com/bundle.js"))
+
+    assert unauthorized == [401]
+
+
+def test_expired_session_is_named_as_such():
+    """The whole point: a 401 must not surface as a selector timeout."""
+    message = x_sync._explain_scrape_failure([401], TimeoutError("Timeout 15000ms exceeded"))
+
+    assert "session expired" in message.lower()
+    assert "cookies" in message.lower()
+
+
+def test_a_timeout_without_a_401_does_not_blame_the_session():
+    """Blaming the session for a selector change would cost the same wasted hunt."""
+    message = x_sync._explain_scrape_failure([], TimeoutError("Timeout 15000ms exceeded"))
+
+    assert "session expired" not in message.lower()
+
+
+def test_an_unrecognised_failure_keeps_its_original_text():
+    message = x_sync._explain_scrape_failure([], RuntimeError("browser vanished"))
+
+    assert "browser vanished" in message

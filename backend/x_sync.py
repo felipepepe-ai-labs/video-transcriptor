@@ -224,6 +224,43 @@ def _extract_tweets(page) -> list[dict]:
     """)
 
 
+def _watch_for_auth_failure(page) -> list[int]:
+    """Record failed X API responses, so a dead session can be named as such.
+
+    Returns a list that fills up as the page navigates: X answers 401 to every
+    GraphQL call once the session cookies stop being valid, which is otherwise
+    indistinguishable from a selector change.
+    """
+    unauthorized: list[int] = []
+
+    def on_response(response) -> None:
+        if response.status in (401, 403) and "/graphql/" in response.url:
+            unauthorized.append(response.status)
+
+    page.on("response", on_response)
+    return unauthorized
+
+
+def _explain_scrape_failure(unauthorized: list[int], exc: Exception) -> str:
+    """Turn a scrape failure into a message that says what to actually do.
+
+    Everything used to surface as `Page.wait_for_selector: Timeout 15000ms
+    exceeded`, which cannot tell an expired session from a DOM change and sends
+    whoever reads it on a long hunt.
+    """
+    if unauthorized:
+        return (
+            "X session expired (the API answered "
+            f"{unauthorized[0]}) — re-import your cookies via POST /x/import-cookies"
+        )
+    if "Timeout" in str(exc):
+        return (
+            "the bookmarks timeline never rendered; X may have changed its "
+            f"markup, or the page failed to load: {exc}"
+        )
+    return f"scraping failed: {exc}"
+
+
 def _count_tweets(page) -> int:
     """How many tweet cards are currently rendered, for progress reporting."""
     return page.evaluate("document.querySelectorAll(\"[data-testid='tweet']\").length")
@@ -326,6 +363,7 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
         browser = pw.chromium.launch(headless=True)
         context = browser.new_context(storage_state=storage_state)
         page = context.new_page()
+        unauthorized = _watch_for_auth_failure(page)
 
         try:
             page.goto("https://x.com/i/bookmarks", wait_until="domcontentloaded", timeout=30_000)
@@ -345,12 +383,17 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
 
             results = _extract_tweets(page)
         except Exception as exc:
-            raise ScrapingError(f"scraping failed: {exc}") from exc
+            raise ScrapingError(_explain_scrape_failure(unauthorized, exc)) from exc
         finally:
             browser.close()
 
     if not results:
-        raise ScrapingError("no bookmarks found — session may have expired")
+        # With a 401 on record this is not a guess, so say so outright.
+        raise ScrapingError(
+            _explain_scrape_failure(unauthorized, RuntimeError("no bookmarks found"))
+            if unauthorized
+            else "no bookmarks found — session may have expired"
+        )
 
     if on_progress:
         on_progress(
