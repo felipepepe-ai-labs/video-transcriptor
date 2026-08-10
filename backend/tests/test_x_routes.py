@@ -5,12 +5,25 @@ app.download.test.js. Background tasks are driven synchronously by FastAPI's
 TestClient, so the download worker's DB effects are observable here.
 """
 
+import asyncio
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
 import x_bookmarks as xb
 import x_sync
+from x_progress import registry as x_progress
+
+
+@pytest.fixture(autouse=True)
+def clean_progress():
+    """The registry is process-global; don't leak in-flight jobs across tests."""
+    yield
+    for subscriber in list(x_progress._subscribers):
+        x_progress.unsubscribe(subscriber)
+    x_progress._active.clear()
 
 
 @pytest.fixture
@@ -168,3 +181,111 @@ def test_download_rejects_a_bookmark_that_was_never_reviewed(client):
 
 def test_download_404s_for_an_unknown_bookmark(client):
     assert client.post("/x/bookmarks/999999/download").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Live progress (SSE)
+# ---------------------------------------------------------------------------
+
+def _read_events(count=1):
+    """Pull the first *count* events off the SSE generator, then close it.
+
+    Driven directly rather than over HTTP: the stream is infinite by design, so
+    a TestClient request would never complete.
+    """
+
+    async def run():
+        response = await app_module.x_progress_stream()
+        iterator = response.body_iterator
+        chunks = []
+        try:
+            for _ in range(count):
+                chunks.append(await iterator.__anext__())
+        finally:
+            await iterator.aclose()
+        return response, chunks
+
+    response, chunks = asyncio.run(run())
+    events = [
+        json.loads(chunk[len("data: "):])
+        for chunk in chunks
+        if chunk.startswith("data: ")
+    ]
+    return response, events
+
+
+def test_progress_stream_is_an_event_stream():
+    response, _ = _read_events()
+
+    assert response.media_type == "text/event-stream"
+    assert response.headers["x-accel-buffering"] == "no"
+
+
+def test_progress_stream_opens_with_a_snapshot():
+    _, events = _read_events()
+
+    assert events[0]["type"] == "snapshot"
+
+
+def test_progress_snapshot_carries_work_already_in_flight():
+    """A tab opened mid-download must still learn that one is running."""
+    x_progress.publish(
+        {"type": "progress", "job": "download", "bookmark_id": 7, "message": "Descargando…"}
+    )
+
+    _, events = _read_events()
+
+    assert [job["bookmark_id"] for job in events[0]["jobs"]] == [7]
+
+
+def test_progress_snapshot_omits_finished_work():
+    x_progress.publish({"type": "progress", "job": "download", "bookmark_id": 7})
+    x_progress.publish({"type": "done", "job": "download", "bookmark_id": 7})
+
+    _, events = _read_events()
+
+    assert events[0]["jobs"] == []
+
+
+def test_progress_stream_forwards_a_live_event():
+    """The snapshot is only the opener; later events must reach the client too."""
+
+    async def run():
+        response = await app_module.x_progress_stream()
+        iterator = response.body_iterator
+        try:
+            await iterator.__anext__()  # the opening snapshot
+            # Published only now: before subscribing it would land in the
+            # snapshot instead of being delivered as a live event.
+            x_progress.publish({"type": "progress", "job": "sync", "message": "Abriendo…"})
+            return await iterator.__anext__()
+        finally:
+            await iterator.aclose()
+
+    chunk = asyncio.run(run())
+
+    assert json.loads(chunk[len("data: "):])["message"] == "Abriendo…"
+
+
+def test_progress_stream_unsubscribes_when_the_client_goes_away():
+    _read_events()
+
+    assert x_progress._subscribers == []
+
+
+def test_download_publishes_a_terminal_event(client, monkeypatch, tmp_path):
+    """The UI refreshes off this event, so it must fire on the no-video path too."""
+    def no_video(*args, **kwargs):
+        raise x_sync.NoMediaFound("no video")
+
+    monkeypatch.setattr(app_module, "_download_video", no_video)
+    row_id = _add(status="interesting")
+    subscriber = x_progress.subscribe()
+
+    client.post(f"/x/bookmarks/{row_id}/download")
+
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    terminal = [e for e in events if e["type"] in ("done", "error")]
+    assert terminal and terminal[-1]["status"] == "no_media"

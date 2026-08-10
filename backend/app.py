@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import queue
 import re
 import shutil
 from pathlib import Path
@@ -8,7 +10,9 @@ from typing import Optional
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
+
+from x_progress import registry as x_progress
 
 import dub
 import jobs
@@ -682,6 +686,49 @@ async def health():
 
 # ── X (Twitter) Bookmarks routes ───────────────────────────────────────
 
+# Seconds between keep-alive comments on an idle SSE stream, so proxies and
+# browsers don't quietly drop a connection that simply has nothing to report.
+_SSE_HEARTBEAT_SECONDS = 15
+
+
+@app.get("/x/progress")
+async def x_progress_stream():
+    """Live progress for the X sync and download workers, as Server-Sent Events.
+
+    Both run as fire-and-forget background tasks, so this is the only way the UI
+    can tell when they actually finish rather than guessing.
+    """
+
+    async def stream():
+        subscriber = x_progress.subscribe()
+        try:
+            yield _sse({"type": "snapshot", "jobs": x_progress.snapshot()})
+            while True:
+                try:
+                    event = await asyncio.to_thread(
+                        subscriber.get, True, _SSE_HEARTBEAT_SECONDS
+                    )
+                except queue.Empty:
+                    yield ": ping\n\n"
+                    continue
+                yield _sse(event)
+        finally:
+            x_progress.unsubscribe(subscriber)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # don't let a proxy buffer the stream
+        },
+    )
+
+
+def _sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
 @app.post("/x/import-cookies")
 async def import_x_cookies(file: UploadFile = File(...)):
     """Upload a Netscape-format cookies.txt file. Validates that the required
@@ -716,13 +763,26 @@ async def sync_x_bookmarks(background_tasks: BackgroundTasks):
 
 def _sync_x_bookmarks_worker(session_path: str) -> None:
     """Background worker for X bookmark sync."""
+    report = x_progress.reporter("sync")
+    report(message="Abriendo x.com/i/bookmarks…")
     try:
-        from x_sync import sync_x_bookmarks, ScrapingError
-        import x_bookmarks as xb
-        sync_x_bookmarks(session_path, db=None)
+        from x_sync import sync_x_bookmarks
+
+        scraped = sync_x_bookmarks(session_path, db=None)
     except ScrapingError as e:
-        # Log the error (in production you'd wire this to a real logger).
         print(f"[x-sync] Error: {e}")  # noqa: T201
+        x_progress.publish({"type": "error", "job": "sync", "bookmark_id": None, "message": str(e)})
+        return
+
+    x_progress.publish(
+        {
+            "type": "done",
+            "job": "sync",
+            "bookmark_id": None,
+            "message": f"{len(scraped)} bookmarks sincronizados",
+            "count": len(scraped),
+        }
+    )
 
 
 @app.get("/x/bookmarks")
@@ -783,20 +843,44 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
     """Background worker for downloading a bookmark's video."""
     import x_bookmarks as xb
 
+    report = x_progress.reporter("download", bookmark_id=int(bm_id))
+    report(message="Descargando video…")
+
     try:
         file_path = _download_video(tweet_url, cookies_path)
     except NoMediaFound:
         # Not a failure: the tweet just isn't a video. Settle it in 'no_media'
         # so it stops looking like a download still pending.
         xb.mark_no_media(int(bm_id))
+        x_progress.publish(
+            {
+                "type": "done",
+                "job": "download",
+                "bookmark_id": int(bm_id),
+                "status": "no_media",
+                "message": "El tweet no tiene video",
+            }
+        )
         return
     except Exception as e:
         print(f"[x-download] Error for bookmark {bm_id}: {e}")  # noqa: T201
+        x_progress.publish(
+            {"type": "error", "job": "download", "bookmark_id": int(bm_id), "message": str(e)}
+        )
         return
 
     # db=None so the store owns the commit — passing a connection in leaves the
     # UPDATE uncommitted and the download is silently lost.
     xb.mark_downloaded(int(bm_id), file_path)
+    x_progress.publish(
+        {
+            "type": "done",
+            "job": "download",
+            "bookmark_id": int(bm_id),
+            "status": "downloaded",
+            "message": "Descarga completada",
+        }
+    )
 
 
 @app.post("/x/bookmarks/{id}/transcribe")
