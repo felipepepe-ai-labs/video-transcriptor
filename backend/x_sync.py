@@ -177,6 +177,24 @@ _SCROLL_STABLE_ROUNDS = 3
 _SCROLL_PAUSE = 1.2  # seconds after each scroll to let content render
 
 
+# A bookmark card links to its tweet several times over — the timestamp, the
+# photo, the analytics page — and all of them carry the same status id.
+_STATUS_URL = re.compile(r"^(https?://[^/]+/[^/]+/status/\d+)")
+
+
+def _permalink_from(url: str | None) -> str | None:
+    """Reduce a tweet link to its canonical permalink, or None if it isn't one.
+
+    The card's first anchor is the author's profile, and feeding that to yt-dlp
+    earns an "Unsupported URL" — a profile page is not a video. Everything past
+    the status id (``/photo/1``, ``/analytics``, query strings) is noise.
+    """
+    if not url:
+        return None
+    match = _STATUS_URL.match(url)
+    return match.group(1) if match else None
+
+
 def _extract_tweets(page) -> list[dict]:
     """Extract visible tweet data from the current DOM via JavaScript evaluation.
 
@@ -188,7 +206,7 @@ def _extract_tweets(page) -> list[dict]:
 
     Returns a list of dicts with keys matching the bookmark DB schema.
     """
-    return page.evaluate("""
+    scraped = page.evaluate("""
         () => {
             const results = [];
             const nodes = document.querySelectorAll("[data-testid='tweet']");
@@ -208,15 +226,22 @@ def _extract_tweets(page) -> list[dict]:
                     thumbnail_url = img?.src || null;
                 }
 
+                // The permalink is the anchor wrapping the timestamp. The card's
+                // *first* anchor is the author's avatar, which points at their
+                // profile — useless to yt-dlp.
+                const statusLinks = Array.from(node.querySelectorAll("a[href*='/status/']"));
+                const permalink =
+                    (statusLinks.find(a => a.querySelector('time')) || statusLinks[0])?.href
+                    ?? null;
+
                 // Expand long tweets / articles by clicking "Show more"
                 let expanded_text = textEl?.innerText?.trim() || null;
                 if (!expanded_text) {
-                    const link = node.querySelector("a[href]");
-                    expanded_text = link?.href || null;
+                    expanded_text = permalink;
                 }
 
                 results.push({
-                    tweet_url: node.querySelector("a[href]")?.href ?? null,
+                    tweet_url: permalink,
                     author: authorEl?.innerText?.trim() || null,
                     text: textEl?.innerText?.trim() || null,
                     thumbnail_url: thumbnail_url,
@@ -227,6 +252,14 @@ def _extract_tweets(page) -> list[dict]:
             return results;
         }
     """)
+
+    # Normalise in Python rather than in the page: it is the one part with logic
+    # of its own, and here it can be unit-tested. Cards without a permalink are
+    # loading skeletons or ads — dropping them lets sync_bookmarks' empty-url
+    # guard do the rest.
+    for tweet in scraped:
+        tweet["tweet_url"] = _permalink_from(tweet.get("tweet_url"))
+    return [tweet for tweet in scraped if tweet["tweet_url"]]
 
 
 # X's GDPR dialog carries no data-testid and follows the account locale, so its

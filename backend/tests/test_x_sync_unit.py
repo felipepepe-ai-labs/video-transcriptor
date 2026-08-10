@@ -186,6 +186,36 @@ def test_sync_rejects_a_session_without_cookies(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Tweet permalinks
+# ---------------------------------------------------------------------------
+
+def test_permalink_keeps_a_plain_status_url():
+    url = "https://x.com/0xCodila/status/2086547599033536913"
+
+    assert x_sync._permalink_from(url) == url
+
+
+def test_permalink_rejects_a_profile_url():
+    """The bug this fixes: the card's first link is the author's profile, and
+    yt-dlp answers 'Unsupported URL' because a profile page is not a video."""
+    assert x_sync._permalink_from("https://x.com/0xCodila") is None
+
+
+@pytest.mark.parametrize(
+    "suffix", ["/photo/1", "/analytics", "/video/1", "?s=20&t=abc"]
+)
+def test_permalink_trims_the_sub_pages_of_the_same_tweet(suffix):
+    """A card carries several /status/ links; they all point at one tweet."""
+    base = "https://x.com/alexconia/status/2086511274100461642"
+
+    assert x_sync._permalink_from(base + suffix) == base
+
+
+def test_permalink_handles_nothing_at_all():
+    assert x_sync._permalink_from(None) is None
+
+
+# ---------------------------------------------------------------------------
 # Scroll progress reporting
 # ---------------------------------------------------------------------------
 
