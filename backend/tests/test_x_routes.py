@@ -273,6 +273,25 @@ def test_progress_stream_unsubscribes_when_the_client_goes_away():
     assert x_progress._subscribers == []
 
 
+def test_sync_reports_its_progress_while_it_scrapes(client, monkeypatch):
+    """The scrape scrolls for up to a minute; the UI needs more than a start event."""
+    def scrape(session_path, db=None, on_progress=None):
+        on_progress(message="Cargando bookmarks… (12 encontrados)", found=12)
+        return []
+
+    monkeypatch.setattr(x_sync, "sync_x_bookmarks", scrape)
+    (app_module.DATA_DIR / "session.json").write_text("{}")  # or the route 400s
+    subscriber = x_progress.subscribe()
+
+    client.post("/x/sync")
+
+    events = []
+    while not subscriber.empty():
+        events.append(subscriber.get_nowait())
+    scraping = [e for e in events if e.get("found") == 12]
+    assert scraping and scraping[0]["job"] == "sync"
+
+
 def test_download_publishes_a_terminal_event(client, monkeypatch, tmp_path):
     """The UI refreshes off this event, so it must fire on the no-video path too."""
     def no_video(*args, **kwargs):

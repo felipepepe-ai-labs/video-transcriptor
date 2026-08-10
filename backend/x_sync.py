@@ -224,7 +224,12 @@ def _extract_tweets(page) -> list[dict]:
     """)
 
 
-def _scroll_until_stable(page) -> bool:
+def _count_tweets(page) -> int:
+    """How many tweet cards are currently rendered, for progress reporting."""
+    return page.evaluate("document.querySelectorAll(\"[data-testid='tweet']\").length")
+
+
+def _scroll_until_stable(page, on_progress=None) -> bool:
     """Scroll the bookmarks page until no new content appears.
 
     Strategy (from x-bookmarks-curator):
@@ -232,6 +237,11 @@ def _scroll_until_stable(page) -> bool:
     - After each scroll, pause ``_SCROLL_PAUSE`` seconds for content to render.
     - Track page height after each round; if height stays the same for
       ``_SCROLL_STABLE_ROUNDS`` consecutive rounds, consider loading done.
+
+    ``on_progress`` is an optional callback taking keyword arguments; at 1.2s per
+    round this loop can run for the better part of a minute, so without it the UI
+    has nothing to show but a frozen message. Kept a plain callback rather than an
+    import of the progress registry, so this module stays a pure scraping seam.
 
     Returns True if stable (new content found), False if no more content appeared.
     """
@@ -244,6 +254,14 @@ def _scroll_until_stable(page) -> bool:
         time.sleep(_SCROLL_PAUSE)
 
         curr_height = page.evaluate("document.body.scrollHeight")
+
+        if on_progress:
+            found = _count_tweets(page)
+            on_progress(
+                message=f"Cargando bookmarks… ({found} encontrados)",
+                round=round_num,
+                found=found,
+            )
 
         if curr_height == prev_height:
             stable_count += 1
@@ -263,7 +281,7 @@ def _scroll_until_stable(page) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
+def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dict]:
     """Scrape X bookmarks using a saved Playwright session.
 
     Parameters
@@ -272,6 +290,10 @@ def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
         Path to the Playwright ``storageState`` JSON (produced by ``import_cookies``).
     db :
         SQLite connection or module-level handle for ``sync_bookmarks()``.
+    on_progress :
+        Optional keyword-argument callback reporting how far the scrape has got.
+        The scroll phase alone can run for the better part of a minute, so a caller
+        driving a UI needs this to say anything truthful while it waits.
 
     Returns
     -------
@@ -311,8 +333,11 @@ def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
             # Wait for the bookmarks list container to appear.
             page.wait_for_selector("[data-testid='tweet']", timeout=15_000)
 
+            if on_progress:
+                on_progress(message="Bookmarks cargados, recorriendo la lista…")
+
             # Scroll until stable.
-            _scroll_until_stable(page)
+            _scroll_until_stable(page, on_progress=on_progress)
 
             # A second mini-scroll pass in case lazy-loading missed something.
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -326,6 +351,12 @@ def sync_x_bookmarks(session_path: str | Path, db) -> list[dict]:
 
     if not results:
         raise ScrapingError("no bookmarks found — session may have expired")
+
+    if on_progress:
+        on_progress(
+            message=f"{len(results)} bookmarks encontrados, guardando…",
+            found=len(results),
+        )
 
     # Persist to DB and return.
     count = sync_bookmarks(db, results)

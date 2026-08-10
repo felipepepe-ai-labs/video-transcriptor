@@ -166,3 +166,63 @@ def test_sync_rejects_a_session_without_cookies(tmp_path):
 
     with pytest.raises(x_sync.ScrapingError, match="import cookies first"):
         x_sync.sync_x_bookmarks(session, db=None)
+
+
+# ---------------------------------------------------------------------------
+# Scroll progress reporting
+# ---------------------------------------------------------------------------
+
+class FakePage:
+    """The two `page.evaluate` shapes `_scroll_until_stable` depends on.
+
+    Heights are consumed one per round; tweet counts grow with each scroll so a
+    test can assert the reported figure actually moves.
+    """
+
+    def __init__(self, heights, counts=None):
+        self.heights = list(heights)
+        self.counts = list(counts or [])
+        self.scrolls = 0
+
+    def evaluate(self, script):
+        if "scrollTo" in script:
+            self.scrolls += 1
+            return None
+        if "scrollHeight" in script:
+            return self.heights.pop(0) if self.heights else 0
+        if "querySelectorAll" in script:
+            return self.counts.pop(0) if self.counts else 0
+        raise AssertionError(f"unexpected script: {script}")
+
+
+@pytest.fixture
+def instant_scroll(monkeypatch):
+    """The real pause is 1.2s per round; a unit test must not wait for it."""
+    monkeypatch.setattr(x_sync.time, "sleep", lambda _seconds: None)
+
+
+def test_scroll_reports_once_per_round(instant_scroll):
+    page = FakePage(heights=[100, 200, 200, 200, 200], counts=[1, 2, 3, 4, 5])
+    reported = []
+
+    x_sync._scroll_until_stable(page, on_progress=lambda **event: reported.append(event))
+
+    assert [event["round"] for event in reported] == [1, 2, 3, 4, 5]
+
+
+def test_scroll_reports_how_many_bookmarks_it_has_found(instant_scroll):
+    """A frozen message is the whole problem; the number is what shows progress."""
+    page = FakePage(heights=[100, 100, 100, 100], counts=[7, 12, 12, 12])
+    reported = []
+
+    x_sync._scroll_until_stable(page, on_progress=lambda **event: reported.append(event))
+
+    assert reported[0]["found"] == 7
+    assert "7" in reported[0]["message"]
+
+
+def test_scroll_without_a_reporter_behaves_exactly_as_before(instant_scroll):
+    page = FakePage(heights=[100, 100, 100, 100])
+
+    assert x_sync._scroll_until_stable(page) is True
+    assert page.scrolls == 4

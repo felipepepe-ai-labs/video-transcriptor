@@ -768,7 +768,7 @@ def _sync_x_bookmarks_worker(session_path: str) -> None:
     try:
         from x_sync import sync_x_bookmarks
 
-        scraped = sync_x_bookmarks(session_path, db=None)
+        scraped = sync_x_bookmarks(session_path, db=None, on_progress=report)
     except ScrapingError as e:
         print(f"[x-sync] Error: {e}")  # noqa: T201
         x_progress.publish({"type": "error", "job": "sync", "bookmark_id": None, "message": str(e)})
