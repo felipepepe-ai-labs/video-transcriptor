@@ -502,7 +502,16 @@ function App() {
       </section>
 
       {/* X Bookmarks panel */}
-      {inputMode === "x" && <XBookmarks />}
+      {inputMode === "x" && (
+        <XBookmarks
+          onOpenJob={(jobId) => {
+            // Same pipeline, same results screen: switch to it rather than
+            // building a second viewer inside the bookmarks panel.
+            setInputMode("file")
+            openJob(jobId)
+          }}
+        />
+      )}
       {inputMode === "settings" && <Settings />}
 
       {/* History */}

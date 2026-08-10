@@ -66,7 +66,8 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     transcription_status TEXT DEFAULT 'none',
     transcript_original TEXT,
     transcript_language TEXT,
-    transcribed_at TEXT
+    transcribed_at TEXT,
+    job_id TEXT
 )
 """
 
@@ -79,6 +80,8 @@ _MIGRATIONS = {
     "transcript_original": "TEXT",
     "transcript_language": "TEXT",
     "transcribed_at": "TEXT",
+    # The transcription job in jobs.db, so a card can link back to its results.
+    "job_id": "TEXT",
 }
 
 
@@ -206,6 +209,22 @@ def set_interesting(db_id: int, interesting: bool, db: sqlite3.Connection | None
             conn.rollback()
             conn.close()
         return False
+
+
+def set_job(db_id: int, job_id: str, db: sqlite3.Connection | None = None) -> bool:
+    """Link a bookmark to the transcription job created for it."""
+    conn = _get_conn() if db is None else db
+    try:
+        cur = conn.execute(
+            "UPDATE bookmarks SET job_id = ?, transcription_status = 'running' WHERE id = ?",
+            (job_id, db_id),
+        )
+        if db is None:
+            conn.commit()
+        return cur.rowcount > 0
+    finally:
+        if db is None:
+            conn.close()
 
 
 def mark_downloaded(db_id: int, file_path: str, db: sqlite3.Connection | None = None) -> bool:

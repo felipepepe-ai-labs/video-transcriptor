@@ -18,6 +18,7 @@ from x_progress import registry as x_progress
 import config
 import dub
 import jobs
+import x_bookmarks as xb
 import youtube
 from x_sync import (
     import_cookies as _import_cookies,
@@ -979,68 +980,95 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
 
 
 @app.post("/x/bookmarks/{id}/transcribe")
-async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks):
-    """Trigger SSH Whisper transcription for a downloaded bookmark video.
-    Requires the remote Whisper server to be configured (same env vars as main jobs)."""
-    import x_bookmarks as xb
+async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks, voice: str = Form("male")):
+    """Run a downloaded bookmark video through the regular transcription pipeline.
+
+    Same route every other source takes: the only thing X does differently is
+    where the file comes from. Returns the job id so the UI can jump straight to
+    it, exactly as uploading a file does.
+    """
     bm = xb.get_bookmark(id)
     if bm is None:
         raise HTTPException(404, "Bookmark not found")
     if not bm.get("local_file_path"):
-        raise HTTPException(400, "No local video file — download first")
+        raise HTTPException(409, "No local video file — download it first")
 
-    background_tasks.add_task(_transcribe_bookmark_worker, id, bm["local_file_path"])
-    return {"ok": True, "message": "Transcription started"}
+    title = (bm.get("author") or "X") + " — " + (bm.get("text") or "")[:60]
+    job_id = jobs.create_job(f"{title}.mp4", source="x", title=title, url=bm["tweet_url"])
+    xb.set_job(id, job_id)
+
+    background_tasks.add_task(
+        _transcribe_bookmark_worker, id, job_id, bm["local_file_path"], title, voice
+    )
+    return {"ok": True, "job_id": job_id, "message": "Transcription started"}
 
 
-def _transcribe_bookmark_worker(bm_id: int, video_path: str) -> None:
-    """Background worker for transcribing a bookmark's downloaded video via remote Whisper."""
-    logger.info("x-transcribe worker started for bookmark %s (%s)", bm_id, video_path)
+def _place_for_pipeline(source: Path, destination: Path) -> None:
+    """Make the downloaded video available under the job's expected name.
+
+    Hard-linked rather than copied: a measured X video weighed 681 MB, and both
+    directories usually hang off DATA_ROOT so the link is free. Across
+    filesystems os.link raises EXDEV, and then there is no way around copying.
+
+    CIFS is the reason for the check afterwards: with DATA_ROOT on a network
+    share, os.link succeeds but *moves* the file, which silently ate the
+    bookmark's download and left it flagged 'downloaded' pointing at nothing.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
     try:
-        # Use the same RemoteWhisper pipeline as regular jobs.
-        remote = RemoteWhisper()
-        remote.connect()
+        os.link(source, destination)
+        if not source.exists():
+            logger.warning("os.link moved %s instead of linking it; restoring", source)
+            shutil.copy2(destination, source)
+    except OSError:
+        shutil.copy2(source, destination)
 
-        srt_content, duration, lang = remote.run_transcribe(language=None)  # auto-detect
 
-        segments = parse_srt(srt_content)
+def _transcribe_bookmark_worker(
+    bm_id: int, job_id: str, video_path: str, title: str, voice: str
+) -> None:
+    """Hand a bookmark's video to the shared pipeline.
 
-        conn = xb._get_conn()
-        try:
-            with xb._lock:
-                conn.execute(
-                    "UPDATE bookmarks SET transcription_status=?, transcript_language=?, transcribed_at=? WHERE id=?",
-                    ("done", lang, time.strftime("%Y-%m-%dT%H:%M:%SZ"), bm_id),
-                )
-                conn.commit()
-        finally:
-            conn.close()
+    Deliberately thin: transcription, translation, narration, dubbing and
+    chapters all live in run_transcription_job, and a second implementation here
+    would only drift from it.
+    """
+    logger.info("x-transcribe worker started for bookmark %s (job %s)", bm_id, job_id)
+    report = x_progress.reporter("transcribe", bookmark_id=int(bm_id))
+    report(message="Preparando el video…", job_id=job_id)
 
-        # Translate segments to Spanish using the existing pipeline.
-        texts_en = [s["text_en"] for s in segments]
+    local_path = UPLOAD_DIR / f"{job_id}.mp4"
+    try:
+        _place_for_pipeline(Path(video_path), local_path)
+    except OSError as e:
+        logger.exception("could not stage %s for job %s", video_path, job_id)
+        jobs.update_job(job_id, status="failed", error=_error_message("500 staging failed", e))
+        x_progress.publish(
+            {"type": "error", "job": "transcribe", "bookmark_id": int(bm_id), "message": str(e)}
+        )
+        return
 
-        def report_translation_progress(done: int, total: int) -> None:
-            pass  # no DB update needed for background worker
+    # source_language=None: a tweet can be in any language, and the pipeline
+    # already skips translation and dubbing when it detects Spanish.
+    run_transcription_job(
+        job_id, local_path, f"{title}.mp4", [], voice,
+        source_language=None, source="x", url=None,
+    )
 
-        texts_es, provider = translate_with_fallback(texts_en, on_progress=report_translation_progress)
-        for seg, text_en, text_es in zip(segments, texts_en, texts_es):
-            seg["text_es"] = text_es
-
-        full_es = "\n".join(s["text_es"] for s in segments)
-
-        conn2 = xb._get_conn()
-        try:
-            with xb._lock:
-                conn2.execute(
-                    "UPDATE bookmarks SET transcript_original=?, full_text_es=?, translation_provider=? WHERE id=?",
-                    ("\n".join(s["text_en"] for s in segments), full_es, provider, bm_id),
-                )
-                conn2.commit()
-        finally:
-            conn2.close()
-
-    except Exception as e:
-        logger.exception("x-transcribe worker failed for bookmark %s", bm_id)
+    finished = jobs.get_job(job_id) or {}
+    status = "done" if finished.get("status") == "done" else "failed"
+    xb.mark_transcribed(bm_id, status, language=(finished.get("result") or {}).get("language"))
+    logger.info("x-transcribe worker finished for bookmark %s (job %s)", bm_id, job_id)
+    x_progress.publish(
+        {
+            "type": "done",
+            "job": "transcribe",
+            "bookmark_id": int(bm_id),
+            "job_id": job_id,
+            "message": "Transcripción completada",
+        }
+    )
 
 
 if __name__ == "__main__":

@@ -37,12 +37,13 @@ function formatDate(scrapedAt) {
   })
 }
 
-function XBookmarks() {
+function XBookmarks({ onOpenJob }) {
   const [bookmarks, setBookmarks] = useState([])
   const [loading, setLoading] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [error, setError] = useState("")
   const [downloadingIds, setDownloadingIds] = useState(new Set())
+  const [transcribingIds, setTranscribingIds] = useState(new Set())
   const [statusFilter, setStatusFilter] = useState(null)
   const [syncMessage, setSyncMessage] = useState("")
   const fileInputRef = useRef(null)
@@ -89,6 +90,16 @@ function XBookmarks() {
           return next
         })
         if (event.type === "error") setError(event.message ?? "Error de descarga")
+      }
+
+      if (event.job === "transcribe") {
+        setTranscribingIds((prev) => {
+          const next = new Set(prev)
+          if (finished) next.delete(event.bookmark_id)
+          else next.add(event.bookmark_id)
+          return next
+        })
+        if (event.type === "error") setError(event.message ?? "Error de transcripción")
       }
 
       if (finished) {
@@ -174,6 +185,22 @@ function XBookmarks() {
     } catch (e) {
       setError(e.message)
       setDownloadingIds((prev) => { const n = new Set(prev); n.delete(id); return n })
+    }
+  }
+
+  async function transcribeBookmark(id) {
+    setTranscribingIds((prev) => new Set(prev).add(id))
+    try {
+      const res = await fetch(`${API_URL}/x/bookmarks/${id}/transcribe`, { method: "POST" })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
+      refreshBookmarks()
+      // Jump to the job just like uploading a file does: from here on it is the
+      // same pipeline, so it deserves the same screen.
+      onOpenJob?.(body.job_id)
+    } catch (e) {
+      setError(e.message)
+      setTranscribingIds((prev) => { const n = new Set(prev); n.delete(id); return n })
     }
   }
 
@@ -278,6 +305,25 @@ function XBookmarks() {
                       aria-label={bm.status === "no_media" ? "Reintentar descarga" : "Descargar"}
                     >
                       {downloadingIds.has(bm.id) ? "⏳" : bm.status === "no_media" ? "🔁" : "⬇️"}
+                    </button>
+                  )}
+                  {bm.status === "downloaded" && !bm.job_id && (
+                    <button
+                      title="Transcribir y traducir (el mismo proceso que YouTube)"
+                      disabled={transcribingIds.has(bm.id)}
+                      onClick={() => transcribeBookmark(bm.id)}
+                      aria-label="Transcribir"
+                    >
+                      {transcribingIds.has(bm.id) ? "⏳" : "📝"}
+                    </button>
+                  )}
+                  {bm.job_id && (
+                    <button
+                      title="Ver la transcripción"
+                      onClick={() => onOpenJob?.(bm.job_id)}
+                      aria-label="Ver transcripción"
+                    >
+                      👁️
                     </button>
                   )}
                   <button

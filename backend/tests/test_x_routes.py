@@ -7,11 +7,13 @@ TestClient, so the download worker's DB effects are observable here.
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import jobs
 import x_bookmarks as xb
 import x_sync
 from x_progress import registry as x_progress
@@ -290,6 +292,100 @@ def test_sync_reports_its_progress_while_it_scrapes(client, monkeypatch):
         events.append(subscriber.get_nowait())
     scraping = [e for e in events if e.get("found") == 12]
     assert scraping and scraping[0]["job"] == "sync"
+
+
+# ---------------------------------------------------------------------------
+# Transcribing a bookmark through the shared pipeline
+# ---------------------------------------------------------------------------
+# X reuses run_transcription_job exactly like YouTube does: the only thing that
+# differs between the three sources is how the file reaches UPLOAD_DIR.
+
+@pytest.fixture
+def pipeline(monkeypatch, tmp_path):
+    """Capture the call into the shared pipeline instead of running it."""
+    calls = []
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    monkeypatch.setattr(app_module, "UPLOAD_DIR", uploads)
+    monkeypatch.setattr(
+        app_module, "run_transcription_job",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    return calls
+
+
+def _downloaded(tmp_path, name="clip.mp4"):
+    clip = tmp_path / name
+    clip.write_bytes(b"video bytes")
+    row_id = _add(status="interesting")
+    xb.mark_downloaded(row_id, str(clip))
+    return row_id, clip
+
+
+def test_transcribing_creates_a_job_for_the_bookmark(client, pipeline, tmp_path):
+    row_id, _ = _downloaded(tmp_path)
+
+    response = client.post(f"/x/bookmarks/{row_id}/transcribe")
+
+    assert response.status_code == 200
+    job = jobs.get_job(response.json()["job_id"])
+    assert job["source"] == "x"
+    assert job["url"] == "https://x.com/a/status/1"
+
+
+def test_the_video_reaches_the_pipeline_without_copying_it(client, pipeline, tmp_path):
+    """A measured X video weighed 681 MB; linking beats duplicating it."""
+    row_id, clip = _downloaded(tmp_path)
+
+    job_id = client.post(f"/x/bookmarks/{row_id}/transcribe").json()["job_id"]
+
+    linked = app_module.UPLOAD_DIR / f"{job_id}.mp4"
+    assert linked.exists()
+    assert linked.stat().st_ino == clip.stat().st_ino  # same bytes on disk
+
+
+def test_the_download_survives_being_handed_to_the_pipeline(client, pipeline, tmp_path, monkeypatch):
+    """On CIFS os.link moves the file instead of linking it, which silently ate
+    the bookmark's download and left it marked 'downloaded' with nothing there."""
+    def link_that_moves(source, destination):
+        Path(destination).write_bytes(Path(source).read_bytes())
+        Path(source).unlink()
+
+    monkeypatch.setattr(app_module.os, "link", link_that_moves)
+    row_id, clip = _downloaded(tmp_path)
+
+    client.post(f"/x/bookmarks/{row_id}/transcribe")
+
+    assert clip.exists(), "the bookmark's own copy must still be there"
+
+
+def test_the_job_is_recorded_on_the_bookmark(client, pipeline, tmp_path):
+    """So the card can offer "see transcription" later."""
+    row_id, _ = _downloaded(tmp_path)
+
+    job_id = client.post(f"/x/bookmarks/{row_id}/transcribe").json()["job_id"]
+
+    assert xb.get_bookmark(row_id)["job_id"] == job_id
+
+
+def test_the_language_is_auto_detected(client, pipeline, tmp_path):
+    """A tweet can be in any language; forcing English would mistranscribe it."""
+    row_id, _ = _downloaded(tmp_path)
+
+    client.post(f"/x/bookmarks/{row_id}/transcribe")
+
+    _, kwargs = pipeline[0]
+    assert kwargs["source_language"] is None
+
+
+def test_transcribing_an_undownloaded_bookmark_is_refused(client, pipeline):
+    row_id = _add(status="interesting")
+
+    assert client.post(f"/x/bookmarks/{row_id}/transcribe").status_code == 409
+
+
+def test_transcribing_an_unknown_bookmark_404s(client, pipeline):
+    assert client.post("/x/bookmarks/999999/transcribe").status_code == 404
 
 
 def test_download_publishes_a_terminal_event(client, monkeypatch, tmp_path):
