@@ -83,7 +83,12 @@ def _parse_netscape(text: str) -> list[dict]:
         domain, http_only, path, secure_str, expiry, name, value = parts[:7]
         cookies.append(
             {
-                "domain": domain.lstrip("."),  # Playwright doesn't want leading dot
+                # Keep the leading dot: in Netscape format ".x.com" means "x.com
+                # and its subdomains", and Playwright honours that distinction.
+                # Stripping it made every cookie host-only, so none reached
+                # api.x.com — where the GraphQL calls go — and a perfectly live
+                # session answered 401 on every request.
+                "domain": domain,
                 "path": path,
                 "name": name,
                 "value": value,

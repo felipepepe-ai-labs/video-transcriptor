@@ -76,6 +76,23 @@ def test_parse_netscape_reads_the_secure_flag():
     assert next(c for c in cookies if c["name"] == "twid")["secure"] is False
 
 
+def test_parse_netscape_keeps_the_domain_dot():
+    """`.x.com` covers subdomains; flattening it keeps auth off api.x.com, which
+    is where every GraphQL call goes — a live session then reads as expired."""
+    cookies = x_sync._parse_netscape(NETSCAPE_SAMPLE)
+
+    assert next(c for c in cookies if c["name"] == "auth_token")["domain"] == ".x.com"
+
+
+def test_parse_netscape_leaves_a_host_only_cookie_host_only():
+    """The dot is meaningful in both directions: don't invent one either."""
+    host_only = "x.com\tFALSE\t/\tTRUE\t1893456000\tnight_mode\t2"
+
+    cookies = x_sync._parse_netscape(host_only)
+
+    assert cookies[0]["domain"] == "x.com"
+
+
 # ---------------------------------------------------------------------------
 # import_cookies
 # ---------------------------------------------------------------------------
