@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import "./App.css"
 import XBookmarks from "./XBookmarks.jsx"
+import Settings from "./Settings.jsx"
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 const POLL_INTERVAL_MS = 2000
@@ -330,6 +331,15 @@ function App() {
           >
             🐦 X
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "settings"}
+            className={inputMode === "settings" ? "active" : ""}
+            onClick={() => setInputMode("settings")}
+          >
+            ⚙️ Ajustes
+          </button>
         </div>
 
         {inputMode === "youtube" && (
@@ -389,6 +399,10 @@ function App() {
         </div>
         )}
 
+        {/* Voice, chapters and the submit button only belong to the two
+            transcription modes; the X and settings panels drive themselves. */}
+        {(inputMode === "file" || inputMode === "youtube") && (
+        <>
         {/* Voice selection */}
         <div className="voice-picker">
           <span className="voice-picker-label">Voz de la locución:</span>
@@ -481,12 +495,15 @@ function App() {
             <span className="progress-bar-label">Subiendo video: {uploadProgress}%</span>
           </div>
         )}
+        </>
+        )}
 
         {error && <div className="error-banner">❌ {error}</div>}
       </section>
 
       {/* X Bookmarks panel */}
       {inputMode === "x" && <XBookmarks />}
+      {inputMode === "settings" && <Settings />}
 
       {/* History */}
       {history.length > 0 && (

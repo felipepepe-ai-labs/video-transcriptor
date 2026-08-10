@@ -12,6 +12,8 @@ import threading
 import time
 from pathlib import Path
 
+import config
+
 # Store the database on local disk (not NFS) to avoid SQLite locking issues.
 import tempfile
 
@@ -21,8 +23,14 @@ def _resolve_db_path() -> Path:
 
 
 DB_PATH = _resolve_db_path()
+# DATA_DIR holds the credentials. The videos live under DATA_ROOT instead, so
+# pointing that at a big disk doesn't drag the cookies along with it.
 DATA_DIR = Path(os.getenv("X_DATA_DIR", str(Path(__file__).parent / "data" / "x-bookmarks")))
-DOWNLOAD_DIR = DATA_DIR / "downloads"
+
+
+def download_dir() -> Path:
+    """Where bookmark videos are saved. Resolved per call, so DATA_ROOT can move."""
+    return config.media_dirs()["x_downloads"]
 
 _lock = threading.Lock()
 
@@ -89,7 +97,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     """Create the bookmarks table (if missing) and apply any pending migrations."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # The download directory is created on demand by download_video(); doing it
+    # here would tie startup to DATA_ROOT being mounted and writable, so a
+    # mistyped setting or an unplugged disk would stop the backend from booting.
     conn = _get_conn()
     try:
         conn.execute(SCHEMA)

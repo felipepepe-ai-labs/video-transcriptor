@@ -62,3 +62,13 @@ Todo configurable por variables de entorno (con los valores actuales como defaul
 | `REMOTE_DEVICE` | `cuda` | Device para Whisper |
 | `REMOTE_DISK_SAFETY_MARGIN` | `3` | Múltiplo del tamaño del archivo que debe haber libre en `/tmp` remoto |
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | Origen permitido por CORS |
+| `DATA_ROOT` | `backend/` | Raíz de los ficheros de media: `uploads/`, `audio/`, `video/` y `x-downloads/` |
+| `LOG_LEVEL` | `INFO` | Nivel de log del backend; `DEBUG` añade el detalle por ronda del scroll de X |
+
+### Por qué las bases de datos no cuelgan de `DATA_ROOT`
+
+`DATA_ROOT` está pensado para apuntar a un disco grande o de red — un solo vídeo de X puede
+ocupar cientos de MB. SQLite **no puede bloquear sobre un share de red**: con el proyecto en
+un montaje CIFS, el backend ni siquiera arranca (`database is locked`). Por eso las dos
+bases (`JOBS_DB_PATH`, `X_BOOKMARKS_DB`) y las credenciales de X (`X_DATA_DIR`) conservan
+sus propias variables y se quedan en disco local salvo que las muevas a propósito.

@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from x_progress import registry as x_progress
 
+import config
 import dub
 import jobs
 import youtube
@@ -36,12 +37,6 @@ from remote import (
 from translate import translate_with_fallback
 
 # ── Config ────────────────────────────────────────────────────────────
-UPLOAD_DIR = Path(__file__).parent / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-AUDIO_DIR = Path(__file__).parent / "audio"
-AUDIO_DIR.mkdir(exist_ok=True)
-VIDEO_DIR = Path(__file__).parent / "video"
-VIDEO_DIR.mkdir(exist_ok=True)
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 
 # Configured first so everything below can log. Module loggers propagate to the
@@ -49,17 +44,35 @@ FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
 # without this the modules stay mute under uvicorn. DEBUG additionally turns on
 # the per-round scroll trace of the X scrape.
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=config.log_level(),
     format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# All three hang off DATA_ROOT (see config.py), which defaults to this directory
+# so an unset environment keeps every file where it already is.
+_MEDIA_DIRS = config.media_dirs()
+UPLOAD_DIR = _MEDIA_DIRS["uploads"]
+AUDIO_DIR = _MEDIA_DIRS["audio"]
+VIDEO_DIR = _MEDIA_DIRS["video"]
+for _media_dir in (UPLOAD_DIR, AUDIO_DIR, VIDEO_DIR):
+    try:
+        _media_dir.mkdir(parents=True, exist_ok=True)  # parents: the root may be new
+    except OSError as _exc:
+        # DATA_ROOT is user-editable now, so an unplugged disk or a bad path must
+        # not stop the backend from booting — the jobs that need these directories
+        # will fail loudly on their own.
+        logger.warning("cannot create %s: %s", _media_dir, _exc)
 
 app = FastAPI(title="Video Transcriptor EN → ES")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],
-    allow_methods=["GET", "POST"],
+    # PATCH and DELETE are used by the bookmarks UI and PUT by the settings
+    # panel; without them here the browser's preflight answers 400 and the
+    # buttons fail with an opaque network error.
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
 
@@ -739,6 +752,72 @@ async def x_progress_stream():
 
 def _sse(event: dict) -> str:
     return f"data: {json.dumps(event)}\n\n"
+
+@app.get("/config")
+async def get_config():
+    """Effective settings, where each came from, and the resolved directories."""
+    return config.describe()
+
+
+@app.get("/config/browse")
+async def browse_directories(path: Optional[str] = None):
+    """List the sub-directories of *path*, for picking a folder from the UI.
+
+    A browser can't reveal a real filesystem path — `webkitdirectory` hands back
+    relative names and hides the rest — so choosing a folder on the server means
+    the server has to enumerate it.
+    """
+    target = Path(path) if path else Path.home()
+
+    if not target.is_dir():
+        raise HTTPException(404, f"no existe el directorio: {target}")
+
+    try:
+        entries = sorted(
+            (e for e in target.iterdir() if e.is_dir() and not e.name.startswith(".")),
+            key=lambda e: e.name.lower(),
+        )
+    except PermissionError:
+        raise HTTPException(403, f"sin permiso para leer {target}")
+
+    return {
+        "path": str(target),
+        # None at the filesystem root, so the UI knows to stop offering "up".
+        "parent": None if target.parent == target else str(target.parent),
+        "entries": [{"name": e.name, "path": str(e)} for e in entries],
+    }
+
+
+@app.put("/config")
+async def put_config(changes: dict):
+    """Save settings from the panel.
+
+    Validation happens before anything is written: a half-applied save would
+    strand future downloads in a directory nobody can write to.
+    """
+    allowed = {k: v for k, v in changes.items() if k in ("data_root", "log_level")}
+    if not allowed:
+        raise HTTPException(400, "nothing to update")
+
+    errors = config.validate_settings(allowed)
+    if errors:
+        raise HTTPException(400, errors)
+
+    if "log_level" in allowed:
+        allowed["log_level"] = str(allowed["log_level"]).upper()
+
+    config.save_settings(allowed)
+    config.apply_log_level()  # takes effect now, no restart needed
+    logger.info("settings updated: %s", ", ".join(sorted(allowed)))
+
+    described = config.describe()
+    # uploads/audio/video were frozen into constants at import time, so a new
+    # root only reaches them after a restart. Say so rather than imply otherwise.
+    described["restart_required"] = (
+        ["uploads", "audio", "video"] if "data_root" in allowed else []
+    )
+    return described
+
 
 @app.post("/x/import-cookies")
 async def import_x_cookies(file: UploadFile = File(...)):

@@ -7,6 +7,9 @@ backend/jobs.db
 backend/uploads/
 backend/audio/
 backend/video/
+backend/x-downloads/
+# Local settings written by the panel: holds this machine's own paths.
+backend/settings.json
 
 # X bookmarks: local store and the X session credentials written by x_sync.py
 backend/x_bookmarks.db

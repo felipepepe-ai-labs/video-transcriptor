@@ -1033,3 +1033,209 @@ header p {
   .status-badge.downloaded { background: #064e3b; color: #6ee7b7; }
   .status-badge.no-media { background: #334155; color: #cbd5e1; }
 }
+
+/* ── Settings panel ──────────────────────────────────────────────────── */
+
+.settings-panel {
+  margin-top: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.75rem;
+  /* #root centres the whole app, but a form with labels above its fields has to
+     read left-to-right. Scoped here so the rest of the layout keeps its centring. */
+  text-align: left;
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.settings-field > label {
+  font-family: var(--heading);
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.settings-hint {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--text);
+}
+
+.settings-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-row input[type="text"],
+.settings-row select {
+  flex: 1 1 20rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--bg);
+  color: var(--text-h);
+  font-family: var(--sans);
+  font-size: 0.95rem;
+}
+
+.settings-row input[type="text"]:focus,
+.settings-row select:focus {
+  outline: none;
+  border-color: var(--accent-border);
+}
+
+.settings-origin {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--text);
+  opacity: 0.8;
+}
+
+.settings-error {
+  margin: 0;
+  font-size: 0.875rem;
+  color: #b91c1c;
+}
+
+.settings-notice {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  border-radius: 0.5rem;
+  background: var(--accent-bg);
+  border: 1px solid var(--accent-border);
+  color: var(--text-h);
+  font-size: 0.9rem;
+}
+
+.settings-dirs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+/* Two columns rather than a wrapping flex row: with flex, the "requiere
+   reiniciar" tag dropped onto its own line and read as if it belonged to the
+   next folder down. */
+.settings-dirs li {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0.6rem;
+  align-items: baseline;
+  font-size: 0.875rem;
+}
+
+.settings-dir-name {
+  color: var(--text-h);
+  font-weight: 500;
+}
+
+.settings-dir-path {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 34rem) {
+  .settings-dirs li {
+    grid-template-columns: 1fr;
+    gap: 0.15rem;
+  }
+}
+
+.settings-dirs code {
+  background: var(--code-bg);
+  padding: 0.15rem 0.4rem;
+  border-radius: 0.3rem;
+  word-break: break-all;
+}
+
+.settings-restart-tag {
+  font-size: 0.75rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 0.75rem;
+  background: var(--social-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.settings-footnote {
+  margin: 0;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+@media (prefers-color-scheme: dark) {
+  .settings-error { color: #fca5a5; }
+}
+
+/* ── Folder browser inside the settings panel ────────────────────────── */
+
+.settings-browser {
+  border: 1px solid var(--border);
+  border-radius: 0.6rem;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  background: var(--social-bg);
+}
+
+.settings-browser-head {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.settings-browser-head code {
+  background: var(--code-bg);
+  padding: 0.2rem 0.45rem;
+  border-radius: 0.3rem;
+  font-size: 0.8rem;
+  word-break: break-all;
+}
+
+.settings-browser-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 15rem;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-browser-list button {
+  width: 100%;
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border: none;
+  border-radius: 0.35rem;
+  background: transparent;
+  color: var(--text-h);
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.settings-browser-list button:hover {
+  background: var(--accent-bg);
+}
+
+.settings-browser-empty {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.875rem;
+  color: var(--text);
+  font-style: italic;
+}
