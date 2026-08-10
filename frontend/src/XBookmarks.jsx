@@ -52,6 +52,57 @@ function XBookmarks() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { refreshBookmarks() }, [statusFilter])
 
+  // Kept in a ref so the SSE handler below always calls the current version
+  // without having to tear down and reopen the stream on every render.
+  const refreshRef = useRef(refreshBookmarks)
+  refreshRef.current = refreshBookmarks
+
+  // Live progress. Sync and download are fire-and-forget background tasks on
+  // the backend, so this stream is the only honest signal that they finished.
+  useEffect(() => {
+    const source = new EventSource(`${API_URL}/x/progress`)
+
+    source.onmessage = (message) => {
+      const event = JSON.parse(message.data)
+
+      if (event.type === "snapshot") {
+        setSyncing(event.jobs.some((j) => j.job === "sync"))
+        setDownloadingIds(
+          new Set(event.jobs.filter((j) => j.job === "download").map((j) => j.bookmark_id))
+        )
+        return
+      }
+
+      const finished = event.type === "done" || event.type === "error"
+
+      if (event.job === "sync") {
+        setSyncing(!finished)
+        setSyncMessage(event.message ?? "")
+        if (event.type === "error") setError(event.message ?? "Error de sincronización")
+      }
+
+      if (event.job === "download") {
+        setDownloadingIds((prev) => {
+          const next = new Set(prev)
+          if (finished) next.delete(event.bookmark_id)
+          else next.add(event.bookmark_id)
+          return next
+        })
+        if (event.type === "error") setError(event.message ?? "Error de descarga")
+      }
+
+      if (finished) {
+        refreshRef.current()
+        if (event.job === "sync") setTimeout(() => setSyncMessage(""), 4000)
+      }
+    }
+
+    // EventSource reconnects on its own; nothing to do but stop shouting.
+    source.onerror = () => {}
+
+    return () => source.close()
+  }, [])
+
   async function refreshBookmarks() {
     setLoading(true)
     setError("")
@@ -89,18 +140,17 @@ function XBookmarks() {
 
   async function handleSync() {
     setError("")
-    setSyncMessage("Sincronizando bookmarks de X...")
+    setSyncMessage("Sincronizando bookmarks de X…")
     setSyncing(true)
     try {
       const res = await fetch(`${API_URL}/x/sync`, { method: "POST" })
       if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`)
-      setSyncMessage("Sincronización completada")
-      refreshBookmarks()
+      // Deliberately no success message here: the request only enqueues the
+      // scrape. The progress stream reports when it actually finishes.
     } catch (e) {
       setError(e.message)
-    } finally {
       setSyncing(false)
-      setTimeout(() => setSyncMessage(""), 4000)
+      setSyncMessage("")
     }
   }
 
@@ -114,15 +164,15 @@ function XBookmarks() {
     }
   }
 
-  async function downloadBookmark(id, url) {
+  async function downloadBookmark(id) {
     setDownloadingIds((prev) => new Set(prev).add(id))
     try {
       const res = await fetch(`${API_URL}/x/bookmarks/${id}/download`, { method: "POST" })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      refreshBookmarks()
+      if (!res.ok) throw new Error((await res.json()).detail ?? `HTTP ${res.status}`)
+      // The spinner is cleared by the progress stream's terminal event, not
+      // here: this response only means the download was enqueued.
     } catch (e) {
       setError(e.message)
-    } finally {
       setDownloadingIds((prev) => { const n = new Set(prev); n.delete(id); return n })
     }
   }
@@ -224,7 +274,7 @@ function XBookmarks() {
                     <button
                       title={bm.status === "no_media" ? "Reintentar descarga" : "Descargar video"}
                       disabled={downloadingIds.has(bm.id)}
-                      onClick={() => downloadBookmark(bm.id, bm.tweet_url)}
+                      onClick={() => downloadBookmark(bm.id)}
                       aria-label={bm.status === "no_media" ? "Reintentar descarga" : "Descargar"}
                     >
                       {downloadingIds.has(bm.id) ? "⏳" : bm.status === "no_media" ? "🔁" : "⬇️"}
