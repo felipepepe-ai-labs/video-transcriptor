@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import queue
 import re
@@ -42,6 +43,16 @@ AUDIO_DIR.mkdir(exist_ok=True)
 VIDEO_DIR = Path(__file__).parent / "video"
 VIDEO_DIR.mkdir(exist_ok=True)
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+
+# Configured first so everything below can log. Module loggers propagate to the
+# root logger, which drops anything below WARNING when nothing configured it —
+# without this the modules stay mute under uvicorn. DEBUG additionally turns on
+# the per-round scroll trace of the X scrape.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)-8s %(name)s | %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Video Transcriptor EN → ES")
 
@@ -763,6 +774,7 @@ async def sync_x_bookmarks(background_tasks: BackgroundTasks):
 
 def _sync_x_bookmarks_worker(session_path: str) -> None:
     """Background worker for X bookmark sync."""
+    logger.info("x-sync worker started, session=%s", session_path)
     report = x_progress.reporter("sync")
     report(message="Abriendo x.com/i/bookmarks…")
     try:
@@ -770,10 +782,11 @@ def _sync_x_bookmarks_worker(session_path: str) -> None:
 
         scraped = sync_x_bookmarks(session_path, db=None, on_progress=report)
     except ScrapingError as e:
-        print(f"[x-sync] Error: {e}")  # noqa: T201
+        logger.exception("x-sync worker failed")
         x_progress.publish({"type": "error", "job": "sync", "bookmark_id": None, "message": str(e)})
         return
 
+    logger.info("x-sync worker finished, %d bookmarks synced", len(scraped))
     x_progress.publish(
         {
             "type": "done",
@@ -843,6 +856,7 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
     """Background worker for downloading a bookmark's video."""
     import x_bookmarks as xb
 
+    logger.info("x-download worker started for bookmark %s (%s)", bm_id, tweet_url)
     report = x_progress.reporter("download", bookmark_id=int(bm_id))
     report(message="Descargando video…")
 
@@ -851,6 +865,7 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
     except NoMediaFound:
         # Not a failure: the tweet just isn't a video. Settle it in 'no_media'
         # so it stops looking like a download still pending.
+        logger.info("bookmark %s has no video, settling it in no_media", bm_id)
         xb.mark_no_media(int(bm_id))
         x_progress.publish(
             {
@@ -863,7 +878,7 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
         )
         return
     except Exception as e:
-        print(f"[x-download] Error for bookmark {bm_id}: {e}")  # noqa: T201
+        logger.exception("x-download worker failed for bookmark %s", bm_id)
         x_progress.publish(
             {"type": "error", "job": "download", "bookmark_id": int(bm_id), "message": str(e)}
         )
@@ -871,6 +886,7 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
 
     # db=None so the store owns the commit — passing a connection in leaves the
     # UPDATE uncommitted and the download is silently lost.
+    logger.info("bookmark %s downloaded to %s", bm_id, file_path)
     xb.mark_downloaded(int(bm_id), file_path)
     x_progress.publish(
         {
@@ -900,6 +916,7 @@ async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks):
 
 def _transcribe_bookmark_worker(bm_id: int, video_path: str) -> None:
     """Background worker for transcribing a bookmark's downloaded video via remote Whisper."""
+    logger.info("x-transcribe worker started for bookmark %s (%s)", bm_id, video_path)
     try:
         # Use the same RemoteWhisper pipeline as regular jobs.
         remote = RemoteWhisper()
@@ -944,7 +961,7 @@ def _transcribe_bookmark_worker(bm_id: int, video_path: str) -> None:
             conn2.close()
 
     except Exception as e:
-        print(f"[x-transcribe] Error for bookmark {bm_id}: {e}")  # noqa: T201
+        logger.exception("x-transcribe worker failed for bookmark %s", bm_id)
 
 
 if __name__ == "__main__":

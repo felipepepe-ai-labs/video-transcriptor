@@ -6,6 +6,7 @@ here: it only has meaning against a live x.com page, exactly as in the original.
 """
 
 import json
+import logging
 import stat
 
 import pytest
@@ -166,6 +167,26 @@ def test_import_cookies_never_leaks_a_cookie_value_in_its_result(
     result = x_sync.import_cookies(cookies_file, data_dir=data_dir)
 
     assert "secret-auth-value" not in json.dumps(result)
+
+
+def test_import_cookies_never_leaks_a_cookie_value_into_the_log(
+    cookies_file, data_dir, caplog
+):
+    """Logs are the other way a credential escapes; names and domains only."""
+    with caplog.at_level(logging.DEBUG):
+        x_sync.import_cookies(cookies_file, data_dir=data_dir)
+
+    assert "secret-auth-value" not in caplog.text
+    assert "secret-csrf-value" not in caplog.text
+
+
+def test_import_cookies_logs_the_domains_it_stored(cookies_file, data_dir, caplog):
+    """The per-domain count is exactly what would have exposed the host-only bug
+    that made every X session read as expired."""
+    with caplog.at_level(logging.INFO):
+        x_sync.import_cookies(cookies_file, data_dir=data_dir)
+
+    assert ".x.com" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +440,45 @@ def test_auth_watcher_records_only_failed_graphql_responses():
     page.handler(FakeResponse(404, "https://abs.twimg.com/bundle.js"))
 
     assert unauthorized == [401]
+
+
+def test_auth_watcher_ignores_403():
+    """403s show up on secondary calls while the scrape succeeds, so treating
+    them as a dead session would be the same false diagnosis in reverse."""
+    class FakeResponse:
+        def __init__(self, status, url):
+            self.status, self.url = status, url
+
+    class HookPage:
+        def on(self, event, handler):
+            self.handler = handler
+
+    page = HookPage()
+    unauthorized = x_sync._watch_for_auth_failure(page)
+
+    page.handler(FakeResponse(403, "https://api.x.com/graphql/abc/Something"))
+
+    assert unauthorized == []
+
+
+def test_auth_watcher_still_logs_a_403_it_does_not_count(caplog):
+    """Reporting an odd response and concluding the session is dead are two
+    different things; the log should show it even when the diagnosis ignores it."""
+    class FakeResponse:
+        def __init__(self, status, url):
+            self.status, self.url = status, url
+
+    class HookPage:
+        def on(self, event, handler):
+            self.handler = handler
+
+    page = HookPage()
+    x_sync._watch_for_auth_failure(page)
+
+    with caplog.at_level(logging.WARNING):
+        page.handler(FakeResponse(403, "https://api.x.com/graphql/abc/Something"))
+
+    assert "403" in caplog.text
 
 
 def test_expired_session_is_named_as_such():

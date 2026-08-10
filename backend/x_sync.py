@@ -43,16 +43,22 @@ class NoMediaFound(SyncError):
 
 # ── Imports ──
 
+import collections
 import json
+import logging
 import os
 import re
 import shutil
 import time
 from pathlib import Path
 
-from x_bookmarks import DATA_DIR, init_db, sync_bookmarks
+from x_bookmarks import DATA_DIR, download_dir, init_db, sync_bookmarks
 
 init_db()  # ensure directory structure exists before any operation
+
+logger = logging.getLogger(__name__)
+
+# Cookie values are credentials: log names and domains, never values.
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +165,17 @@ def import_cookies(netscape_path: str | Path, data_dir: Path | None = None) -> d
     # re-serialising it — a lossy rewrite silently produces an unusable file.
     shutil.copyfile(Path(netscape_path), cookies_file)
     os.chmod(str(cookies_file), 0o600)
+
+    # The per-domain breakdown is the tell for the host-only bug that made every
+    # live session answer 401: cookies without a leading dot never reach api.x.com.
+    by_domain = dict(collections.Counter(c["domain"] for c in cookies))
+    logger.info(
+        "imported %d X cookies into %s — domains: %s, required present: %s",
+        len(cookies),
+        session_path,
+        by_domain,
+        sorted(found),
+    )
 
     return {
         "ok": True,
@@ -297,6 +314,7 @@ def _dismiss_cookie_banner(page) -> bool:
             if not locator.count():
                 continue
             locator.first.click(timeout=_CONSENT_TIMEOUT_MS)
+            logger.info("dismissed X's cookie consent dialog via %r", text)
             return True
         except Exception:
             continue
@@ -315,14 +333,21 @@ def _await_timeline(page) -> None:
     can still tell an expired session from a markup change.
     """
     last_error: Exception | None = None
-    for _round in range(_TIMELINE_ROUNDS):
+    for round_num in range(1, _TIMELINE_ROUNDS + 1):
         try:
             page.wait_for_selector("[data-testid='tweet']", timeout=_TIMELINE_ROUND_MS)
+            logger.info("bookmarks timeline rendered after %d round(s)", round_num)
             return
         except Exception as exc:
             last_error = exc
+            logger.info(
+                "timeline not up yet (round %d/%d), retrying the consent dialog",
+                round_num,
+                _TIMELINE_ROUNDS,
+            )
             _dismiss_cookie_banner(page)
 
+    logger.warning("timeline never rendered after %d rounds", _TIMELINE_ROUNDS)
     raise last_error
 
 
@@ -332,11 +357,23 @@ def _watch_for_auth_failure(page) -> list[int]:
     Returns a list that fills up as the page navigates: X answers 401 to every
     GraphQL call once the session cookies stop being valid, which is otherwise
     indistinguishable from a selector change.
+
+    Only 401 counts. A working session still draws the odd 403 on secondary
+    calls while the timeline loads and the scrape succeeds, so treating those as
+    a dead session would be the same false diagnosis in reverse.
     """
     unauthorized: list[int] = []
 
     def on_response(response) -> None:
-        if response.status in (401, 403) and "/graphql/" in response.url:
+        if "/graphql/" not in response.url:
+            return
+        if response.status in (401, 403, 429):
+            # Logged whatever the status: reporting an odd response and concluding
+            # the session is dead are different jobs.
+            logger.warning(
+                "X API answered %d for %s", response.status, response.url.split("/")[-1][:60]
+            )
+        if response.status == 401:
             unauthorized.append(response.status)
 
     page.on("response", on_response)
@@ -393,6 +430,16 @@ def _scroll_until_stable(page, on_progress=None) -> bool:
         time.sleep(_SCROLL_PAUSE)
 
         curr_height = page.evaluate("document.body.scrollHeight")
+
+        # Guarded, not just level-gated: the arguments themselves cost a DOM query
+        # per round, and this is the noisiest loop in the module (up to 40 rounds).
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "scroll round %d: height=%s, tweets=%s",
+                round_num,
+                curr_height,
+                _count_tweets(page),
+            )
 
         if on_progress:
             found = _count_tweets(page)
@@ -460,6 +507,12 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
     except ImportError as exc:
         raise ScrapingError("playwright is not installed; run: pip install playwright && playwright install chromium") from exc
 
+    logger.info(
+        "starting X bookmarks scrape with %d cookies from %s",
+        len(storage_state["cookies"]),
+        session_path,
+    )
+
     results: list[dict] = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -485,7 +538,9 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
             time.sleep(_SCROLL_PAUSE)
 
             results = _extract_tweets(page)
+            logger.info("extracted %d bookmarks from the timeline", len(results))
         except Exception as exc:
+            logger.warning("scrape failed: %s", exc)
             raise ScrapingError(_explain_scrape_failure(unauthorized, exc)) from exc
         finally:
             browser.close()
@@ -530,7 +585,8 @@ def download_video(
     DownloadFailed
         yt-dlp failed, or reported success without writing anything.
     """
-    dest_dir = dest_dir or DATA_DIR / "downloads"
+    # Explicit dest_dir wins (tests inject one); otherwise DATA_ROOT decides.
+    dest_dir = dest_dir or download_dir()
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     # Use yt-dlp directly (already a dependency of the app).
@@ -549,6 +605,7 @@ def download_video(
         tweet_url,
     ]
 
+    logger.info("yt-dlp downloading %s into %s", tweet_url, dest_dir)
     proc = subprocess.run(
         cmd,
         capture_output=True,
@@ -557,6 +614,9 @@ def download_video(
     )
 
     stderr = proc.stderr or ""
+    logger.info("yt-dlp exited %d for %s", proc.returncode, tweet_url)
+    if stderr.strip():
+        logger.debug("yt-dlp stderr: %s", stderr.strip()[:1000])
     # Same test as the curator's download.js: only these two phrasings mean
     # "this tweet is not a video". A generic 'missing' is a real failure.
     if re.search(r"no video|no media found", stderr, re.IGNORECASE):
