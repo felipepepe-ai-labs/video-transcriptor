@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 import app as app_module
 import dub as dub_module
 import jobs as jobs_module
+import media_names
 import remote as remote_module
 
 SRT_SAMPLE = """1
@@ -225,6 +226,16 @@ def install_failing_paramiko(monkeypatch, error_factory):
     monkeypatch.setattr(
         remote_module.paramiko, "SSHClient", lambda: FakeConnectingSSHClient(error_factory)
     )
+
+
+def job_video_dir(job_id):
+    """Where a job's video artefacts landed.
+
+    Resolved the same way the app resolves it, rather than rebuilt from the id:
+    the names carry a readable slug now, and a test that hardcodes the layout
+    either breaks or -- worse -- passes vacuously against a path nothing writes.
+    """
+    return media_names.find_media_dir(app_module.VIDEO_DIR, job_id)
 
 
 @pytest.fixture
@@ -540,7 +551,7 @@ def test_retts_chapter_rebuilds_only_that_chapter(client, monkeypatch, real_vide
     job = client.get(f"/jobs/{job_id}").json()
     assert job["result"]["chapter_clips_available"] is True
 
-    ch0_before = (app_module.VIDEO_DIR / job_id / "chapters" / "00.mp4").read_bytes()
+    ch0_before = (job_video_dir(job_id) / "chapters" / "00.mp4").read_bytes()
 
     slice_calls = []
     real_extract = dub_module.extract_video_slice
@@ -557,7 +568,7 @@ def test_retts_chapter_rebuilds_only_that_chapter(client, monkeypatch, real_vide
 
     assert job2["status"] == "done"
     assert slice_calls == [(2.5, 4.0)]  # only chapter 1's window was rebuilt
-    ch0_after = (app_module.VIDEO_DIR / job_id / "chapters" / "00.mp4").read_bytes()
+    ch0_after = (job_video_dir(job_id) / "chapters" / "00.mp4").read_bytes()
     assert ch0_after == ch0_before
     assert len(fake.piper_commands) == 2  # once for the job, once for the chapter retts
 
@@ -756,6 +767,63 @@ def test_zero_chapters_skips_split_stage(client, monkeypatch, real_video_bytes):
     assert "chapter_clips_error" not in result
 
 
+# ── Media written before the readable-name scheme ────────────────────────
+# Every job already on disk is named '{job_id}.ext' with a bare '{job_id}/'
+# directory. Those jobs must keep serving their media, or the change silently
+# 404s the entire existing history.
+
+def test_audio_written_under_the_old_name_is_still_served(client):
+    job_id = jobs_module.create_job("charla.mp4")
+    (app_module.AUDIO_DIR / f"{job_id}.wav").write_bytes(make_fake_wav())
+
+    response = client.get(f"/jobs/{job_id}/audio")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+
+
+def test_a_dubbed_video_in_the_old_directory_is_still_served(client):
+    job_id = jobs_module.create_job("charla.mp4")
+    legacy_dir = app_module.VIDEO_DIR / job_id
+    (legacy_dir / "chapters").mkdir(parents=True)
+    (legacy_dir / "dubbed.mp4").write_bytes(b"dubbed bytes")
+    (legacy_dir / "chapters" / "00.mp4").write_bytes(b"chapter bytes")
+
+    assert client.get(f"/jobs/{job_id}/video").content == b"dubbed bytes"
+    assert client.get(f"/jobs/{job_id}/chapters/0/video").content == b"chapter bytes"
+
+
+def test_chapter_audio_under_the_old_name_is_still_served(client):
+    job_id = jobs_module.create_job("charla.mp4")
+    (app_module.AUDIO_DIR / f"{job_id}_ch1.wav").write_bytes(make_fake_wav())
+
+    assert client.get(f"/jobs/{job_id}/chapters/1/audio").status_code == 200
+
+
+def test_deleting_an_old_job_still_removes_its_media(client):
+    job_id = jobs_module.create_job("charla.mp4")
+    (app_module.AUDIO_DIR / f"{job_id}.wav").write_bytes(make_fake_wav())
+    legacy_dir = app_module.VIDEO_DIR / job_id
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "dubbed.mp4").write_bytes(b"dubbed bytes")
+
+    assert client.delete(f"/jobs/{job_id}").status_code == 200
+    assert not (app_module.AUDIO_DIR / f"{job_id}.wav").exists()
+    assert not legacy_dir.exists()
+
+
+def test_downloads_are_named_after_the_video_not_the_id(client):
+    """The frontend's download="..." is ignored on these cross-origin links,
+    so Content-Disposition is what the user actually ends up with."""
+    job_id = jobs_module.create_job("Charla sobre Rust.mp4")
+    (app_module.AUDIO_DIR / f"{job_id}.wav").write_bytes(make_fake_wav())
+
+    disposition = client.get(f"/jobs/{job_id}/audio").headers["content-disposition"]
+
+    assert "charla-sobre-rust" in disposition
+    assert job_id not in disposition
+
+
 def test_work_dir_removed_after_full_success(client, monkeypatch, real_video_bytes):
     """The work_dir (VIDEO_DIR/job_id/work) used to build the narration
     track must be cleaned up after a fully successful run."""
@@ -774,7 +842,7 @@ def test_work_dir_removed_after_full_success(client, monkeypatch, real_video_byt
     job = client.get(f"/jobs/{job_id}").json()
 
     assert job["status"] == "done"
-    work_dir = app_module.VIDEO_DIR / job_id / "work"
+    work_dir = job_video_dir(job_id) / "work"
     assert not work_dir.exists()
 
 
@@ -798,5 +866,5 @@ def test_work_dir_removed_when_muxing_fails(client, monkeypatch):
     job = client.get(f"/jobs/{job_id}").json()
 
     assert job["status"] == "done"
-    work_dir = app_module.VIDEO_DIR / job_id / "work"
+    work_dir = job_video_dir(job_id) / "work"
     assert not work_dir.exists()

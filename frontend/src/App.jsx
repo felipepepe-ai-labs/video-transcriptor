@@ -710,7 +710,7 @@ function App() {
             }}>
               📋 Copiar texto
             </button>
-            <button onClick={() => downloadSrt(result.segments, tab)}>
+            <button onClick={() => downloadSrt(result.segments, tab, result.filename)}>
               ⬇️ Descargar SRT
             </button>
           </div>
@@ -810,7 +810,21 @@ function uploadWithProgress(formData, onProgress) {
   })
 }
 
-function downloadSrt(segments, lang) {
+/** Filesystem-safe stem from a video's name, so three exports do not collide. */
+function srtStem(filename) {
+  const stem = (filename ?? "").replace(/\.[^.]+$/, "")
+  const slug = stem
+    .normalize("NFKD")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/[\s_]+/g, "-")
+    .slice(0, 60)
+    .replace(/-+$/, "")
+    .toLowerCase()
+  return slug || "transcripcion"
+}
+
+function downloadSrt(segments, lang, filename) {
   const key = lang === "es" ? "text_es" : "text_en"
   const text = segments.map((seg, i) => {
     const start = seg.start.replace(".", ",")
@@ -822,7 +836,7 @@ function downloadSrt(segments, lang) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement("a")
   a.href = url
-  a.download = `transcripcion.${lang}.srt`
+  a.download = `${srtStem(filename)}.${lang}.srt`
   a.click()
   URL.revokeObjectURL(url)
 }

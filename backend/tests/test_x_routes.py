@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import jobs
+import media_names
 import x_bookmarks as xb
 import x_sync
 from x_progress import registry as x_progress
@@ -339,8 +340,9 @@ def test_the_video_reaches_the_pipeline_without_copying_it(client, pipeline, tmp
 
     job_id = client.post(f"/x/bookmarks/{row_id}/transcribe").json()["job_id"]
 
-    linked = app_module.UPLOAD_DIR / f"{job_id}.mp4"
-    assert linked.exists()
+    # Resolved rather than rebuilt from the id: the name carries a slug now.
+    linked = media_names.find_media(app_module.UPLOAD_DIR, job_id)
+    assert linked is not None
     assert linked.stat().st_ino == clip.stat().st_ino  # same bytes on disk
 
 

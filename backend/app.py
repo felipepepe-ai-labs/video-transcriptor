@@ -18,6 +18,7 @@ from x_progress import registry as x_progress
 import config
 import dub
 import jobs
+import media_names
 import x_bookmarks as xb
 import youtube
 from x_sync import (
@@ -188,6 +189,32 @@ def _validated_voice(voice: str) -> str:
     return voice
 
 
+# ── Where a job's media lives ───────────────────────────────────────
+# Names carry a readable slug so the media directories can be browsed, but the
+# job id stays in front because it is still the index -- see media_names.
+def _job_video_dir(job_id: str, title: str) -> Path:
+    """This job's directory under video/.
+
+    An existing one wins, whichever scheme named it: a re-run against a job
+    from before the slug existed must reuse its directory rather than start a
+    second one beside it.
+    """
+    return media_names.find_media_dir(VIDEO_DIR, job_id) or (
+        VIDEO_DIR / media_names.media_dir_name(job_id, title)
+    )
+
+
+def _job_title(result: dict) -> str:
+    """What to slug a job's files with."""
+    return Path(result.get("filename") or "video").stem
+
+
+def _download_stem(job_id: str) -> str:
+    """Base name for a file the user downloads, read from the job record."""
+    job = jobs.get_job(job_id) or {}
+    return media_names.slugify(Path(job.get("filename") or job.get("title") or "video").stem)
+
+
 # ── Background worker ───────────────────────────────────────────────
 def _error_message(prefix: str, exc: Exception) -> str:
     return f"{prefix}: {exc}"
@@ -218,14 +245,17 @@ def _run_narration_and_dub(job_id, remote, local_path, duration, segments, forma
 
     texts_es = [s["text_es"] for s in segments]
     segment_starts = [ts_to_seconds(s["start"]) for s in segments]
-    work_dir = VIDEO_DIR / job_id / "work"
+    title = _job_title(result)
+    video_dir = _job_video_dir(job_id, title)
+    work_dir = video_dir / "work"
 
     narration_track = None
     try:
         narration_track = _synthesize_narration_track(
             remote, texts_es, segment_starts, duration, work_dir, voice, on_progress=report_tts_progress
         )
-        (AUDIO_DIR / f"{job_id}.wav").write_bytes(narration_track.read_bytes())
+        narration_path = AUDIO_DIR / media_names.media_name(job_id, title, ".wav")
+        narration_path.write_bytes(narration_track.read_bytes())
         result["audio_available"] = True
         result.pop("audio_error", None)
     except (TTSFailed, dub.DubbingFailed) as e:
@@ -241,7 +271,7 @@ def _run_narration_and_dub(job_id, remote, local_path, duration, segments, forma
     if narration_track is not None:
         jobs.update_job(job_id, stage="dubbing")
         try:
-            dubbed_path = VIDEO_DIR / job_id / "dubbed.mp4"
+            dubbed_path = video_dir / "dubbed.mp4"
             dub.mux_audio_into_video(local_path, narration_track, dubbed_path)
             result["dubbed_video_available"] = True
         except dub.DubbingFailed as e:
@@ -253,7 +283,7 @@ def _run_narration_and_dub(job_id, remote, local_path, duration, segments, forma
             try:
                 dub.split_video_by_chapters(
                     dubbed_path, formatted_chapters, total_duration=duration,
-                    output_dir=VIDEO_DIR / job_id / "chapters",
+                    output_dir=video_dir / "chapters",
                 )
                 result["chapter_clips_available"] = True
             except dub.DubbingFailed as e:
@@ -376,6 +406,10 @@ def run_youtube_job(job_id: str, url: str, chapters: list[dict], voice: str) -> 
         return
 
     title = meta["title"]
+    # Only now is there a title to name the file after: yt-dlp had to run first.
+    named_path = UPLOAD_DIR / media_names.media_name(job_id, title, ".mp4")
+    local_path = local_path.rename(named_path)
+
     # The video's own chapter markers are adopted only when the user didn't
     # provide explicit ones -- explicit input always wins.
     if not chapters:
@@ -395,13 +429,12 @@ def rerun_narration_job(job_id: str, voice: str) -> None:
     re-transcribe, no re-translate."""
     job = jobs.get_job(job_id)
     result = job["result"]
-    suffix = Path(result["filename"]).suffix or ".mp4"
-    local_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    local_path = media_names.find_media(UPLOAD_DIR, job_id)
     remote = RemoteWhisper()
 
     try:
         try:
-            if not local_path.exists():
+            if local_path is None:
                 raise FileNotFoundError("Original video is no longer available locally")
             remote.connect()
             _run_narration_and_dub(
@@ -435,13 +468,13 @@ def rerun_chapter_narration_job(job_id: str, index: int, voice: str) -> None:
     result = job["result"]
     start, end, chapter_segments = _chapter_window_and_segments(result, index)
 
-    suffix = Path(result["filename"]).suffix or ".mp4"
-    local_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    local_path = media_names.find_media(UPLOAD_DIR, job_id)
+    video_dir = _job_video_dir(job_id, _job_title(result))
     remote = RemoteWhisper()
 
     try:
         try:
-            if not local_path.exists():
+            if local_path is None:
                 raise FileNotFoundError("Original video is no longer available locally")
             if not chapter_segments:
                 raise ValueError("No segments found in this chapter")
@@ -449,7 +482,7 @@ def rerun_chapter_narration_job(job_id: str, index: int, voice: str) -> None:
 
             texts_es = [s["text_es"] for s in chapter_segments]
             segment_starts = [ts_to_seconds(s["start"]) - start for s in chapter_segments]
-            work_dir = VIDEO_DIR / job_id / f"work_chapter_{index}"
+            work_dir = video_dir / f"work_chapter_{index}"
 
             def report_tts_progress(done: int, total: int) -> None:
                 jobs.update_job(
@@ -464,7 +497,7 @@ def rerun_chapter_narration_job(job_id: str, index: int, voice: str) -> None:
 
             slice_path = work_dir / "slice.mp4"
             dub.extract_video_slice(local_path, start, end, slice_path)
-            chapter_path = VIDEO_DIR / job_id / "chapters" / f"{index:02d}.mp4"
+            chapter_path = video_dir / "chapters" / f"{index:02d}.mp4"
             dub.mux_audio_into_video(slice_path, narration_track, chapter_path)
             shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -494,7 +527,7 @@ def rerun_chapter_audio_job(job_id: str, index: int, voice: str) -> None:
 
             texts_es = [s["text_es"] for s in chapter_segments]
             segment_starts = [ts_to_seconds(s["start"]) - start for s in chapter_segments]
-            work_dir = VIDEO_DIR / job_id / f"work_chapter_audio_{index}"
+            work_dir = _job_video_dir(job_id, _job_title(result)) / f"work_chapter_audio_{index}"
 
             def report_tts_progress(done: int, total: int) -> None:
                 jobs.update_job(
@@ -506,7 +539,8 @@ def rerun_chapter_audio_job(job_id: str, index: int, voice: str) -> None:
             narration_track = _synthesize_narration_track(
                 remote, texts_es, segment_starts, end - start, work_dir, voice, on_progress=report_tts_progress
             )
-            (AUDIO_DIR / f"{job_id}_ch{index}.wav").write_bytes(narration_track.read_bytes())
+            chapter_audio = AUDIO_DIR / media_names.chapter_audio_name(job_id, index, _job_title(result))
+            chapter_audio.write_bytes(narration_track.read_bytes())
             shutil.rmtree(work_dir, ignore_errors=True)
 
             # Persisted on the job (like audio_available/chapter_clips_available)
@@ -546,7 +580,7 @@ async def create_job(
     # for a job without needing a DB column just to track that mapping.
     job_id = jobs.create_job(video.filename)
     suffix = Path(video.filename).suffix or ".mp4"
-    local_path = UPLOAD_DIR / f"{job_id}{suffix}"
+    local_path = UPLOAD_DIR / media_names.media_name(job_id, Path(video.filename).stem, suffix)
     with open(local_path, "wb") as f:
         shutil.copyfileobj(video.file, f, length=1048576)
 
@@ -594,35 +628,53 @@ async def get_job(job_id: str):
 async def delete_job(job_id: str):
     if not jobs.delete_job(job_id):
         raise HTTPException(404, "Job not found")
-    (AUDIO_DIR / f"{job_id}.wav").unlink(missing_ok=True)
+    narration = media_names.find_media(AUDIO_DIR, job_id)
+    if narration:
+        narration.unlink(missing_ok=True)
     for chapter_audio in AUDIO_DIR.glob(f"{job_id}_ch*.wav"):
         chapter_audio.unlink(missing_ok=True)
-    shutil.rmtree(VIDEO_DIR / job_id, ignore_errors=True)
+    video_dir = media_names.find_media_dir(VIDEO_DIR, job_id)
+    if video_dir:
+        shutil.rmtree(video_dir, ignore_errors=True)
     return {"deleted": job_id}
 
 
+# The download name is decided here, not in the browser: the frontend's
+# download="..." attribute is ignored because these links are cross-origin
+# (:5173 → :8000), so Content-Disposition is what the user actually gets.
 @app.get("/jobs/{job_id}/audio")
 async def get_job_audio(job_id: str):
-    audio_path = AUDIO_DIR / f"{job_id}.wav"
-    if not audio_path.exists():
+    audio_path = media_names.find_media(AUDIO_DIR, job_id)
+    if audio_path is None:
         raise HTTPException(404, "Audio not available for this job")
-    return FileResponse(audio_path, media_type="audio/wav", filename=f"{job_id}.wav")
+    return FileResponse(
+        audio_path, media_type="audio/wav",
+        filename=f"{_download_stem(job_id)}.locucion.wav",
+    )
 
 
 @app.get("/jobs/{job_id}/video")
 async def get_job_video(job_id: str):
-    video_path = VIDEO_DIR / job_id / "dubbed.mp4"
-    if not video_path.exists():
+    video_dir = media_names.find_media_dir(VIDEO_DIR, job_id)
+    video_path = video_dir / "dubbed.mp4" if video_dir else None
+    if video_path is None or not video_path.exists():
         raise HTTPException(404, "Dubbed video not available for this job")
-    return FileResponse(video_path, media_type="video/mp4", filename=f"{job_id}_dubbed.mp4")
+    return FileResponse(
+        video_path, media_type="video/mp4",
+        filename=f"{_download_stem(job_id)}.doblado.mp4",
+    )
 
 
 @app.get("/jobs/{job_id}/chapters/{index}/video")
 async def get_job_chapter_video(job_id: str, index: int):
-    chapter_path = VIDEO_DIR / job_id / "chapters" / f"{index:02d}.mp4"
-    if not chapter_path.exists():
+    video_dir = media_names.find_media_dir(VIDEO_DIR, job_id)
+    chapter_path = video_dir / "chapters" / f"{index:02d}.mp4" if video_dir else None
+    if chapter_path is None or not chapter_path.exists():
         raise HTTPException(404, "Chapter clip not available for this job")
-    return FileResponse(chapter_path, media_type="video/mp4", filename=f"{job_id}_chapter{index:02d}.mp4")
+    return FileResponse(
+        chapter_path, media_type="video/mp4",
+        filename=f"{_download_stem(job_id)}.cap{index:02d}.mp4",
+    )
 
 
 def _require_reranable_job(job_id: str) -> dict:
@@ -700,10 +752,13 @@ async def generate_chapter_audio(
 
 @app.get("/jobs/{job_id}/chapters/{index}/audio")
 async def get_job_chapter_audio(job_id: str, index: int):
-    audio_path = AUDIO_DIR / f"{job_id}_ch{index}.wav"
-    if not audio_path.exists():
+    audio_path = media_names.find_chapter_audio(AUDIO_DIR, job_id, index)
+    if audio_path is None:
         raise HTTPException(404, "Audio not available for this chapter")
-    return FileResponse(audio_path, media_type="audio/wav", filename=f"{job_id}_chapter{index:02d}.wav")
+    return FileResponse(
+        audio_path, media_type="audio/wav",
+        filename=f"{_download_stem(job_id)}.cap{index:02d}.locucion.wav",
+    )
 
 
 @app.get("/health")
@@ -1066,7 +1121,7 @@ def _transcribe_bookmark_worker(
     report = x_progress.reporter("transcribe", bookmark_id=int(bm_id))
     report(message="Preparando el video…", job_id=job_id)
 
-    local_path = UPLOAD_DIR / f"{job_id}.mp4"
+    local_path = UPLOAD_DIR / media_names.media_name(job_id, title, ".mp4")
     try:
         _place_for_pipeline(Path(video_path), local_path)
     except OSError as e:

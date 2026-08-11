@@ -691,7 +691,11 @@ def download_video(
         # --newline: without it yt-dlp repaints one line with \r, and reading
         # by lines would block until the download finished.
         "--newline",
-        "-o", str(dest_dir / "%(id)s.%(ext)s"),
+        # Author and title rather than the bare tweet id, so x-downloads/ can be
+        # browsed. --restrict-filenames keeps it ASCII and shell-safe; the tweet
+        # id stays last to keep the name unique.
+        "--restrict-filenames",
+        "-o", str(dest_dir / "%(uploader_id)s-%(title).60s-%(id)s.%(ext)s"),
         tweet_url,
     ]
 
