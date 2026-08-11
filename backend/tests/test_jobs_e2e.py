@@ -55,9 +55,14 @@ def make_fake_wav(duration: float = 0.3) -> bytes:
 class FakeChannel:
     def __init__(self, exit_status):
         self._exit_status = exit_status
+        self.timeout = None
 
     def recv_exit_status(self):
         return self._exit_status
+
+    def settimeout(self, value):
+        """The SFTP channel gets a deadline so a wedged transfer raises."""
+        self.timeout = value
 
 
 class FakeStream:
@@ -97,9 +102,15 @@ class FakeSFTP:
         self._piper_out_dirs = piper_out_dirs
         self._on_put = on_put
 
-    def put(self, local, remote):
+    def put(self, local, remote, callback=None, **kwargs):
         if self._on_put:
             self._on_put(local, remote)
+        # Real paramiko drives the upload progress bar through this.
+        if callback:
+            callback(1, 1)
+
+    def get_channel(self):
+        return FakeChannel(0)
 
     def listdir_attr(self, path):
         if path in self._piper_out_dirs:

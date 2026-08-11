@@ -734,6 +734,18 @@ function App() {
               </span>
             </div>
           )}
+          {/* Sending the file to the GPU box takes minutes for a large video;
+              a bare label here reads the same whether it is moving or wedged. */}
+          {job?.stage === "uploading" && job?.progress > 0 && (
+            <div className="progress-wrap">
+              <div className="progress-bar">
+                <div className="progress-bar-fill" style={{ width: `${job.progress}%` }} />
+              </div>
+              <span className="progress-bar-label">
+                Enviando al servidor de transcripción: {Math.round(job.progress)}%
+              </span>
+            </div>
+          )}
         </div>
       )}
     </div>

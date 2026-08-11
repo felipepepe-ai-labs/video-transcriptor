@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import asynccontextmanager
 import logging
 import os
 import queue
@@ -66,7 +67,18 @@ for _media_dir in (UPLOAD_DIR, AUDIO_DIR, VIDEO_DIR):
         # will fail loudly on their own.
         logger.warning("cannot create %s: %s", _media_dir, _exc)
 
-app = FastAPI(title="Video Transcriptor EN → ES")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # A process that just started has no workers, so any job still marked
+    # running belongs to a process that is gone. Say so instead of letting the
+    # UI poll a corpse.
+    reaped = jobs.fail_orphaned_jobs()
+    if reaped:
+        logger.warning("marked %d interrupted job(s) as failed on startup", reaped)
+    yield
+
+
+app = FastAPI(title="Video Transcriptor EN → ES", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -315,7 +327,14 @@ def run_transcription_job(
             file_size = local_path.stat().st_size
             remote.connect()
             remote.check_disk_space(file_size)
-            remote.upload(local_path, filename)
+
+            # A large video spends minutes here. Without this the stage label
+            # sits frozen on "Subiendo video..." with no way to tell a slow
+            # upload from a wedged one.
+            def report_upload_progress(percent: float) -> None:
+                jobs.update_job(job_id, progress=percent)
+
+            remote.upload(local_path, filename, on_progress=report_upload_progress)
 
             jobs.update_job(job_id, stage="transcribing")
             srt_content, duration, detected_language = remote.run_transcribe(language=source_language)
@@ -1158,4 +1177,9 @@ def _transcribe_bookmark_worker(
 
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    # Opt-in, not the default: reload restarts the server whenever a file is
+    # saved, and that kills any job in flight -- these run for tens of minutes.
+    uvicorn.run(
+        "app:app", host="0.0.0.0", port=8000,
+        reload=os.getenv("RELOAD") == "1",
+    )

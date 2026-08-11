@@ -34,6 +34,21 @@ class TTSFailed(Exception):
 # Both are real es_ES (Castilian) models -- picked over Kokoro, whose
 # Spanish pack has no es_ES/es_419 split. sharvard-medium is a multi-speaker
 # model (speaker_id_map M=0, F=1); davefx-medium is single-speaker (male).
+# Deadlines. paramiko defaults every one of these to "wait forever", which is
+# how a 681 MB upload over a flaky link froze a job for 21 hours: no exception,
+# no log, nothing to see from outside.
+CONNECT_TIMEOUT_SECONDS = 15  # TCP connect to the remote box
+BANNER_TIMEOUT_SECONDS = 20  # SSH banner, slow to arrive on a loaded host
+AUTH_TIMEOUT_SECONDS = 20  # key exchange and auth
+TRANSFER_TIMEOUT_SECONDS = 120  # no bytes moving on the SFTP channel for this long
+# Keepalive is what turns a link that silently died into an exception: without
+# it TCP alone can sit on a dead socket for hours before giving up.
+KEEPALIVE_SECONDS = 30
+
+# One progress report per whole percentage point. paramiko calls back roughly
+# every 32 KB, which for a 681 MB file would be ~21,000 SQLite writes.
+_PROGRESS_STEP = 1.0
+
 VOICE_PRESETS = {
     "male": {"model": "es_ES-davefx-medium", "speaker": None},
     "female": {"model": "es_ES-sharvard-medium", "speaker": 1},
@@ -85,7 +100,13 @@ class RemoteWhisper:
                 username=self.user,
                 allow_agent=True,
                 look_for_keys=True,
+                timeout=CONNECT_TIMEOUT_SECONDS,
+                banner_timeout=BANNER_TIMEOUT_SECONDS,
+                auth_timeout=AUTH_TIMEOUT_SECONDS,
             )
+            transport = client.get_transport()
+            if transport is not None:
+                transport.set_keepalive(KEEPALIVE_SECONDS)
             self._ssh = client
         except (paramiko.SSHException, OSError) as e:
             raise RemoteUnavailable(f"Could not reach {self.host}: {e}") from e
@@ -106,7 +127,13 @@ class RemoteWhisper:
                 f"({file_size_bytes} bytes x {self.disk_safety_margin} safety margin)"
             )
 
-    def upload(self, local_path: str | Path, filename: str) -> str:
+    def upload(self, local_path: str | Path, filename: str, on_progress=None) -> str:
+        """Push the video to remote /tmp, reporting percent complete as it goes.
+
+        `on_progress` receives a float 0-100, at most once per whole point --
+        paramiko itself calls back every 32 KB, and a caller that persists each
+        one would write to SQLite thousands of times per upload.
+        """
         if self._ssh is None:
             self.connect()
         self._file_id = uuid.uuid4().hex[:8]
@@ -114,7 +141,27 @@ class RemoteWhisper:
         self._remote_path = f"/tmp/whisper_{self._file_id}{suffix}"
         sftp = self._ssh.open_sftp()
         try:
-            sftp.put(str(local_path), self._remote_path)
+            # Bound the channel so a transfer that stops moving raises rather
+            # than blocking on a socket nobody is answering.
+            channel = sftp.get_channel()
+            if channel is not None:
+                channel.settimeout(TRANSFER_TIMEOUT_SECONDS)
+
+            callback = None
+            if on_progress:
+                last = [-1.0]
+
+                def callback(transferred, total):  # noqa: F811 (paramiko's shape)
+                    if not total:
+                        return
+                    percent = round(transferred / total * 100, 1)
+                    # The second clause guarantees a final 100; the `last` check
+                    # stops the tail blocks, which all round to 100, repeating it.
+                    if percent - last[0] >= _PROGRESS_STEP or (percent >= 100 > last[0]):
+                        last[0] = percent
+                        on_progress(percent)
+
+            sftp.put(str(local_path), self._remote_path, callback=callback)
         finally:
             sftp.close()
         return self._remote_path
