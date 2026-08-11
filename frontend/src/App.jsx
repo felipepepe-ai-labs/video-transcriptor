@@ -36,6 +36,7 @@ function App() {
   const [chapterAudioReady, setChapterAudioReady] = useState({}) // { [chapterIndex]: true }
   const [chapterAudioLoading, setChapterAudioLoading] = useState(null) // chapterIndex currently generating, or null
   const [playingChapterVideo, setPlayingChapterVideo] = useState(null) // chapterIndex playing inline video, or null
+  const [summaryLoading, setSummaryLoading] = useState(null) // jobId currently generating summary, or null
   const pollRef = useRef(null)
 
   useEffect(() => {
@@ -252,9 +253,36 @@ function App() {
     }
   }
 
+  async function generateSummary(jobId, btnEl) {
+    setSummaryLoading(jobId)
+    setError("")
+    try {
+      const res = await fetch(`${API_URL}/jobs/${jobId}/summarize`, { method: "POST" })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+      // Poll until summary appears on this job.
+      const poll = setInterval(async () => {
+        const jRes = await fetch(`${API_URL}/jobs/${jobId}`)
+        const jData = await jRes.json()
+        if (jData.result?.summary_es) {
+          clearInterval(poll)
+          setSummaryLoading(null)
+          openJob(jobId)
+          refreshHistory()
+        }
+      }, 2000)
+
+      // Timeout after 5 minutes.
+      setTimeout(() => { clearInterval(poll); setSummaryLoading(null) }, 300_000)
+    } catch (e) {
+      setError(e.message)
+      setSummaryLoading(null)
+    }
+  }
+
   function formatDate(unixSeconds) {
     if (!unixSeconds) return ""
-    return new Date(unixSeconds * 1000).toLocaleString("es-AR", {
+    return new Date(unixSeconds * 1000).toLocaleString("es-ES", {
       day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
     })
   }
@@ -275,7 +303,7 @@ function App() {
     <div className="app">
       <header>
         <h1>🎬 Video → Transcripción ES</h1>
-        <p>Subí un video o pegá una URL de YouTube: transcripción, traducción al español y doblaje</p>
+        <p>Sube un video o pega una URL de YouTube: transcripción, traducción al español y doblaje</p>
       </header>
 
       {/* Upload area */}
@@ -324,6 +352,7 @@ function App() {
             <input
               type="url"
               placeholder="https://www.youtube.com/watch?v=..."
+
               value={youtubeUrl}
               onChange={(e) => setYoutubeUrl(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") handleSubmit() }}
@@ -369,8 +398,8 @@ function App() {
           ) : (
             <>
               <span className="upload-icon">☁️</span>
-              <strong>Arrastrá tu video acá</strong>
-              <small>o hacé clic para seleccionar</small>
+              <strong>Arrastra tu video aquí</strong>
+              <small>o haz clic para seleccionar</small>
             </>
           )}
         </div>
@@ -454,6 +483,16 @@ function App() {
                   <span className="history-filename">{h.title || h.filename}</span>
                   <span className="history-date">{formatDate(h.created_at)}</span>
                 </button>
+                {h.status === "done" && !h.summary_es && (
+                  <button
+                    className="history-generate-summary"
+                    onClick={(e) => { e.stopPropagation(); generateSummary(h.id, e); }}
+                    title="Generar resumen"
+                    disabled={summaryLoading === h.id}
+                  >
+                    {summaryLoading === h.id ? "⏳" : "📝"}
+                  </button>
+                )}
                 <button
                   className="history-delete"
                   onClick={(e) => deleteJob(h.id, e)}
@@ -481,6 +520,14 @@ function App() {
             <span>🧩 {result.segments.length} segmentos</span>
             {result.chapters?.length > 0 && <span>📑 {result.chapters.length} capítulos</span>}
           </div>
+
+          {/* Summary */}
+          {result.summary_es && (
+            <details className="summary-panel" open>
+              <summary>📝 Resumen</summary>
+              <p className="summary-text">{result.summary_es}</p>
+            </details>
+          )}
 
           {/* Narration audio */}
           {result.audio_available && job?.id && (

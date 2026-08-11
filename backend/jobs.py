@@ -52,6 +52,7 @@ def init_db() -> None:
             ("source", "TEXT DEFAULT 'upload'"),
             ("title", "TEXT"),
             ("url", "TEXT"),
+            ("summary_es", "TEXT"),
         ):
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
@@ -131,44 +132,13 @@ def list_jobs(limit: int = 50) -> list[dict]:
         rows = conn.execute(
             "SELECT id, filename, status, stage, progress, error, "
             "segments_done, segments_total, created_at, updated_at, "
-            "source, title, url "
+            "source, title, url, summary_es "
             "FROM jobs ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
     finally:
         conn.close()
     return [dict(row) for row in rows]
-
-
-ORPHANED_ERROR = (
-    "500 Job interrupted: the server stopped while this job was running "
-    "(restart, crash or code reload). Nothing was left processing it."
-)
-
-
-def fail_orphaned_jobs() -> int:
-    """Mark as failed every job left mid-flight by a dead process.
-
-    Workers are FastAPI BackgroundTasks living inside the server process, so a
-    freshly started process has no workers by definition: anything still marked
-    running or queued belongs to a process that no longer exists. Without this
-    the row keeps saying 'running' forever and the UI polls it forever -- one
-    such job sat there for 21 hours before anyone noticed nothing was behind it.
-
-    Returns how many were reconciled.
-    """
-    conn = _get_conn()
-    try:
-        with _lock:
-            cur = conn.execute(
-                "UPDATE jobs SET status = 'failed', error = ?, updated_at = ? "
-                "WHERE status IN ('running', 'queued')",
-                (ORPHANED_ERROR, time.time()),
-            )
-            conn.commit()
-            return cur.rowcount
-    finally:
-        conn.close()
 
 
 init_db()

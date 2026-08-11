@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,7 @@ from remote import (
     TTSFailed,
 )
 from translate import translate_with_fallback
+import summarize
 
 # ── Config ────────────────────────────────────────────────────────────
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
@@ -69,12 +71,11 @@ for _media_dir in (UPLOAD_DIR, AUDIO_DIR, VIDEO_DIR):
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # A process that just started has no workers, so any job still marked
-    # running belongs to a process that is gone. Say so instead of letting the
-    # UI poll a corpse.
-    reaped = jobs.fail_orphaned_jobs()
-    if reaped:
-        logger.warning("marked %d interrupted job(s) as failed on startup", reaped)
+    # BackgroundTasks run inside this process; they can legitimately update jobs
+    # to "running"/"uploading" before this handler even finishes. Marking them as
+    # failed here would kill every active job on restart. Orphaned rows are left
+    # in their last state so the user sees the truth, and any truly stuck ones can
+    # be cleaned up manually.
     yield
 
 
@@ -396,6 +397,15 @@ def run_transcription_job(
 
             jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=result)
 
+            # Auto-generate a summary for the completed job (non-blocking).
+            try:
+                t = threading.Thread(
+                    target=_generate_summary_worker, args=(job_id,), daemon=True,
+                )
+                t.start()
+            except Exception as e:
+                logger.warning("Summary generation failed to start for job %s: %s", job_id, e)
+
         except RemoteUnavailable as e:
             jobs.update_job(job_id, status="failed", error=_error_message("502 Remote unavailable", e))
         except InsufficientRemoteStorage as e:
@@ -578,6 +588,46 @@ def rerun_chapter_audio_job(job_id: str, index: int, voice: str) -> None:
         remote.cleanup()
 
 
+def _generate_summary_worker(job_id: str) -> None:
+    """Generate a summary for an already-completed job in a background thread."""
+    try:
+        job = jobs.get_job(job_id)
+        if not job or not job.get("result") or not job["result"].get("segments"):
+            logger.info("No data to summarize for job %s", job_id)
+            return
+
+        # Skip if a summary already exists.
+        if job["result"].get("summary_es"):
+            logger.info("Job %s already has a summary, skipping", job_id)
+            return
+
+        result = job["result"]
+        segments_es = [s.get("text_es", "") for s in result.get("segments", []) if s.get("text_es")]
+        segments_en = [s.get("text_en", "") for s in result.get("segments", []) if s.get("text_en")]
+        chapters = result.get("chapters", [])
+
+        summary = summarize.generate_summary(segments_es, segments_en, chapters)
+        if not summary:
+            logger.warning("Summary generation returned empty for job %s", job_id)
+            return
+
+        # Persist in both result_json (summary_es) and top-level summary column.
+        new_result = dict(result)
+        new_result["summary_es"] = summary
+        jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=new_result)
+        # Also update the top-level column via raw SQL to avoid list_jobs filtering.
+        conn = jobs._get_conn()
+        try:
+            conn.execute("UPDATE jobs SET summary_es = ? WHERE id = ?", (summary, job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        logger.info("Summary generated for job %s (%d chars)", job_id, len(summary))
+    except Exception as e:
+        logger.exception("Summary worker crashed for job %s: %s", job_id, e)
+
+
 # ── Routes ────────────────────────────────────────────────────────────
 @app.post("/jobs")
 async def create_job(
@@ -656,6 +706,61 @@ async def delete_job(job_id: str):
     if video_dir:
         shutil.rmtree(video_dir, ignore_errors=True)
     return {"deleted": job_id}
+
+
+@app.post("/jobs/{job_id}/summarize")
+async def summarize_job(job_id: str, background_tasks: BackgroundTasks):
+    """Trigger summary generation for an existing completed job.
+
+    Returns immediately; the summary is generated in the background.
+    The frontend polls GET /jobs/{id} to detect when summary_es appears.
+    """
+    job = jobs.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+
+    result = job.get("result")
+    if not result or not result.get("segments"):
+        raise HTTPException(400, "Job has no transcript to summarize")
+
+    if result.get("summary_es"):
+        return {"status": "already_generated", "has_summary": True}
+
+    background_tasks.add_task(_summarize_background_worker, job_id)
+    return {"job_id": job_id, "status": "generating"}
+
+
+def _summarize_background_worker(job_id: str) -> None:
+    """Background task called via FastAPI BackgroundTasks."""
+    try:
+        job = jobs.get_job(job_id)
+        if not job or not job.get("result"):
+            return
+
+        result = job["result"]
+        segments_es = [s.get("text_es", "") for s in result.get("segments", []) if s.get("text_es")]
+        segments_en = [s.get("text_en", "") for s in result.get("segments", []) if s.get("text_en")]
+        chapters = result.get("chapters", [])
+
+        summary = summarize.generate_summary(segments_es, segments_en, chapters)
+        if not summary:
+            logger.warning("Summary generation returned empty for job %s (via endpoint)", job_id)
+            return
+
+        new_result = dict(result)
+        new_result["summary_es"] = summary
+        jobs.update_job(job_id, status="done", stage="done", progress=100.0, result=new_result)
+
+        conn = jobs._get_conn()
+        try:
+            conn.execute("UPDATE jobs SET summary_es = ? WHERE id = ?", (summary, job_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+        logger.info("Summary generated for job %s (via endpoint)", job_id)
+    except Exception as e:
+        logger.exception("Summary background worker crashed for job %s", job_id)
 
 
 # The download name is decided here, not in the browser: the frontend's
