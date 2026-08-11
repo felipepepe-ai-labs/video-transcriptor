@@ -940,8 +940,20 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
     report = x_progress.reporter("download", bookmark_id=int(bm_id))
     report(message="Descargando video…")
 
+    def report_download(percent=None, size=None, speed=None, message=None):
+        """Forward yt-dlp's own progress onto the stream the card listens to."""
+        if percent is None:
+            report(message=message or "Descargando video…")
+            return
+        detail = f"{percent:.0f}%"
+        if size:
+            detail += f" de {size}"
+        if speed:
+            detail += f" · {speed}"
+        report(message=f"Descargando… {detail}", percent=percent, size=size, speed=speed)
+
     try:
-        file_path = _download_video(tweet_url, cookies_path)
+        file_path = _download_video(tweet_url, cookies_path, on_progress=report_download)
     except NoMediaFound:
         # Not a failure: the tweet just isn't a video. Settle it in 'no_media'
         # so it stops looking like a download still pending.

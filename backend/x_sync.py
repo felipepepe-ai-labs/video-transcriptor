@@ -47,8 +47,10 @@ import collections
 import json
 import logging
 import os
+import queue
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -568,11 +570,95 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
 # Download helper (yt-dlp via Python subprocess, matching curator's approach)
 # ---------------------------------------------------------------------------
 
+# yt-dlp's progress output, as emitted with --newline. Verbatim samples:
+#   [download]   4.4% of  337.53KiB at  852.37KiB/s ETA 00:00
+#   [download] 100% of  337.53KiB in 00:00:00 at 2.36MiB/s
+_YTDLP_PROGRESS = re.compile(
+    r"^\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%\s+of\s+~?\s*(?P<size>\S+)"
+    r"(?:\s+at\s+(?P<speed>\S+))?(?:\s+in\s+\S+\s+at\s+(?P<final_speed>\S+))?"
+)
+_YTDLP_FORMATS = re.compile(r"Downloading (\d+) format\(s\)")
+
+# The deadline is on silence, not on total duration: a large file over a slow
+# line legitimately takes as long as it takes, whereas yt-dlp saying nothing at
+# all never becomes healthy again.
+_YTDLP_STALL_SECONDS = 120
+
+
+def _parse_progress_line(line: str) -> dict | None:
+    """Turn one line of yt-dlp output into a progress fact, or None if it says nothing.
+
+    Pure on purpose: the fiddly parts — two shapes of percent line, the format
+    count, the start of each pass — are then testable without a subprocess.
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    match = _YTDLP_PROGRESS.match(line)
+    if match:
+        return {
+            "percent": float(match.group("percent")),
+            "size": match.group("size"),
+            "speed": match.group("speed") or match.group("final_speed"),
+        }
+
+    formats = _YTDLP_FORMATS.search(line)
+    if formats:
+        return {"formats": int(formats.group(1))}
+
+    if line.startswith("[download] Destination:"):
+        return {"pass_started": True}
+
+    if "Merging formats" in line:
+        return {"merging": True}
+
+    return None
+
+
+class _ProgressTracker:
+    """Folds yt-dlp's per-pass percentages into one that only ever goes up.
+
+    With `bestvideo+bestaudio` yt-dlp downloads two files, counting 0-100 for
+    each. Reporting that raw sends the bar back to zero halfway through, which
+    reads as a restart — worse than showing nothing at all.
+    """
+
+    def __init__(self) -> None:
+        self.total_passes = 1
+        self.completed_passes = -1  # the first Destination line makes this 0
+
+    def feed(self, line: str) -> dict | None:
+        fact = _parse_progress_line(line)
+        if fact is None:
+            return None
+
+        if "formats" in fact:
+            self.total_passes = max(1, fact["formats"])
+            return None
+
+        if fact.get("pass_started"):
+            self.completed_passes += 1
+            return None
+
+        if fact.get("merging"):
+            return {"message": "Uniendo pistas…"}
+
+        done = max(0, self.completed_passes)
+        overall = (done + fact["percent"] / 100) / self.total_passes * 100
+        return {
+            "percent": round(min(overall, 100.0), 1),
+            "size": fact["size"],
+            "speed": fact["speed"],
+        }
+
 
 def download_video(
     tweet_url: str,
     cookies_path: str | Path,
     dest_dir: Path | None = None,
+    on_progress=None,
+    stall_timeout: float = _YTDLP_STALL_SECONDS,
 ) -> str:
     """Download a video from the given tweet using yt-dlp.
 
@@ -583,7 +669,8 @@ def download_video(
     NoMediaFound
         The tweet has no video — an ordinary outcome, not an error.
     DownloadFailed
-        yt-dlp failed, or reported success without writing anything.
+        yt-dlp failed, went ``stall_timeout`` seconds without saying anything,
+        or reported success without writing anything.
     """
     # Explicit dest_dir wins (tests inject one); otherwise DATA_ROOT decides.
     dest_dir = dest_dir or download_dir()
@@ -601,22 +688,71 @@ def download_video(
         "--cookies", str(cookies_path),
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
         "--merge-output-format", "mp4",
+        # --newline: without it yt-dlp repaints one line with \r, and reading
+        # by lines would block until the download finished.
+        "--newline",
         "-o", str(dest_dir / "%(id)s.%(ext)s"),
         tweet_url,
     ]
 
     logger.info("yt-dlp downloading %s into %s", tweet_url, dest_dir)
-    proc = subprocess.run(
+
+    # Popen rather than run(): run() only hands back its output once the process
+    # is over, so there would be nothing to report while a 681 MB file downloads.
+    # Both streams go to one pipe — reading two of them from a single thread
+    # deadlocks as soon as the one you are not reading fills up.
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
-        timeout=300,  # 5 min max per download.
+        bufsize=1,  # line buffered, so progress arrives as it happens
     )
 
-    stderr = proc.stderr or ""
+    # Iterating the pipe directly is what makes live progress possible, but it
+    # also blocks with no deadline: a wedged yt-dlp would hang this worker for
+    # good. So a reader thread does the blocking, and this one waits on a queue
+    # it *can* put a timeout on. The sentinel marks end of output.
+    lines: queue.Queue = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for line in proc.stdout:
+                lines.put(line)
+        finally:
+            lines.put(None)
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    tracker = _ProgressTracker()
+    output_lines: list[str] = []
+    try:
+        while True:
+            try:
+                line = lines.get(timeout=stall_timeout)
+            except queue.Empty:
+                # Kill rather than just give up: subprocess.run() used to do this
+                # on timeout, and an orphaned yt-dlp would keep pulling against X.
+                proc.kill()
+                raise DownloadFailed(
+                    f"yt-dlp stalled: no output for {stall_timeout}s "
+                    f"downloading {tweet_url}"
+                )
+            if line is None:
+                break
+            output_lines.append(line)
+            if on_progress:
+                update = tracker.feed(line)
+                if update:
+                    on_progress(**update)
+        proc.wait(timeout=stall_timeout)
+    finally:
+        proc.stdout.close()
+
+    stderr = "".join(output_lines)
     logger.info("yt-dlp exited %d for %s", proc.returncode, tweet_url)
     if stderr.strip():
-        logger.debug("yt-dlp stderr: %s", stderr.strip()[:1000])
+        logger.debug("yt-dlp output: %s", stderr.strip()[-1000:])
     # Same test as the curator's download.js: only these two phrasings mean
     # "this tweet is not a video". A generic 'missing' is a real failure.
     if re.search(r"no video|no media found", stderr, re.IGNORECASE):

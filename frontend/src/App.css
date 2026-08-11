@@ -1239,3 +1239,34 @@ header p {
   color: var(--text);
   font-style: italic;
 }
+
+/* ── Download progress inside a bookmark card ────────────────────────── */
+
+.download-progress {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.85rem 0;
+}
+
+.download-progress-bar {
+  flex: 1;
+  height: 0.4rem;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.download-progress-fill {
+  height: 100%;
+  background: #6366f1;
+  border-radius: 999px;
+  transition: width 0.25s ease;
+}
+
+.download-progress-label {
+  font-size: 0.72rem;
+  color: var(--text);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;  /* stops the % jittering as it counts */
+}

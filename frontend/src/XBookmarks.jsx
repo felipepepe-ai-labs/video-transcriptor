@@ -44,6 +44,8 @@ function XBookmarks({ onOpenJob }) {
   const [error, setError] = useState("")
   const [downloadingIds, setDownloadingIds] = useState(new Set())
   const [transcribingIds, setTranscribingIds] = useState(new Set())
+  // {bookmarkId: {percent, size, speed}} while yt-dlp is running.
+  const [downloadProgress, setDownloadProgress] = useState({})
   const [statusFilter, setStatusFilter] = useState(null)
   const [syncMessage, setSyncMessage] = useState("")
   const fileInputRef = useRef(null)
@@ -68,8 +70,16 @@ function XBookmarks({ onOpenJob }) {
 
       if (event.type === "snapshot") {
         setSyncing(event.jobs.some((j) => j.job === "sync"))
-        setDownloadingIds(
-          new Set(event.jobs.filter((j) => j.job === "download").map((j) => j.bookmark_id))
+        const downloads = event.jobs.filter((j) => j.job === "download")
+        setDownloadingIds(new Set(downloads.map((j) => j.bookmark_id)))
+        // The snapshot carries each worker's last event, so a reload mid-download
+        // gets its bar back where it was instead of a bare spinner.
+        setDownloadProgress(
+          Object.fromEntries(
+            downloads
+              .filter((j) => j.percent != null)
+              .map((j) => [j.bookmark_id, { percent: j.percent, size: j.size, speed: j.speed }])
+          )
         )
         return
       }
@@ -87,6 +97,16 @@ function XBookmarks({ onOpenJob }) {
           const next = new Set(prev)
           if (finished) next.delete(event.bookmark_id)
           else next.add(event.bookmark_id)
+          return next
+        })
+        setDownloadProgress((prev) => {
+          const next = { ...prev }
+          if (finished) delete next[event.bookmark_id]
+          else if (event.percent != null) {
+            next[event.bookmark_id] = {
+              percent: event.percent, size: event.size, speed: event.speed,
+            }
+          }
           return next
         })
         if (event.type === "error") setError(event.message ?? "Error de descarga")
@@ -285,6 +305,21 @@ function XBookmarks({ onOpenJob }) {
                   <small className="bookmark-date">{formatDate(bm.scraped_at)}</small>
                 )}
               </div>
+              {downloadProgress[bm.id] && (
+                <div className="download-progress">
+                  <div className="download-progress-bar">
+                    <div
+                      className="download-progress-fill"
+                      style={{ width: `${downloadProgress[bm.id].percent}%` }}
+                    />
+                  </div>
+                  <span className="download-progress-label">
+                    {Math.round(downloadProgress[bm.id].percent)}%
+                    {downloadProgress[bm.id].size && ` de ${downloadProgress[bm.id].size}`}
+                    {downloadProgress[bm.id].speed && ` · ${downloadProgress[bm.id].speed}`}
+                  </span>
+                </div>
+              )}
               <div className="bookmark-footer">
                 <span className={`status-badge ${statusClass(bm.status)}`}>
                   {STATUS_LABELS[bm.status] ?? bm.status}
