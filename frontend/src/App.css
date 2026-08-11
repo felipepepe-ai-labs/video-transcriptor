@@ -1271,6 +1271,29 @@ header p {
   font-variant-numeric: tabular-nums;  /* stops the % jittering as it counts */
 }
 
+/* ── Shared job options inside the X panel ───────────────────────────── */
+
+.x-job-options {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+/* ── Pipeline stage on a bookmark card ───────────────────────────────── */
+
+.bookmark-stage {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.85rem 0;
+}
+
+.bookmark-stage-label {
+  font-size: 0.72rem;
+  color: var(--text);
+}
+
 /* The shared .btn-primary is sized for the main "Transcribir" call to action.
    In this toolbar it dwarfed the button beside it, so it keeps the emphasis
    (filled background) at the size of its neighbours. */

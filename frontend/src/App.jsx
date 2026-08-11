@@ -2,21 +2,13 @@ import { useEffect, useRef, useState } from "react"
 import "./App.css"
 import XBookmarks from "./XBookmarks.jsx"
 import Settings from "./Settings.jsx"
+import VoicePicker from "./VoicePicker.jsx"
+import ChaptersEditor from "./ChaptersEditor.jsx"
+import { cleanChapters } from "./chapters.js"
+import { STAGE_LABELS } from "./stages.js"
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 const POLL_INTERVAL_MS = 2000
-
-const STAGE_LABELS = {
-  downloading: "Descargando video de YouTube...",
-  uploading: "Subiendo video...",
-  transcribing: "Transcribiendo con Whisper...",
-  translating: "Traduciendo al español...",
-  voicing: "Generando locución por segmento...",
-  voicing_chapter: "Regenerando locución del capítulo...",
-  dubbing: "Mezclando el audio con el video...",
-  splitting: "Recortando el video por capítulos...",
-  done: "Listo",
-}
 
 const STATUS_ICONS = {
   queued: "⏳",
@@ -168,12 +160,9 @@ function App() {
     const formData = new FormData()
     formData.append("voice", voice)
 
-    const cleanChapters = chapters
-      .filter((c) => c.title.trim())
-      .map((c) => ({ time: parseTimeToSeconds(c.time), title: c.title.trim() }))
-
-    if (cleanChapters.length) {
-      formData.append("chapters_json", JSON.stringify(cleanChapters))
+    const cleaned = cleanChapters(chapters)
+    if (cleaned.length) {
+      formData.append("chapters_json", JSON.stringify(cleaned))
     }
 
     if (inputMode === "youtube") {
@@ -261,18 +250,6 @@ function App() {
       setLoading(false)
       setChapterAudioLoading(null)
     }
-  }
-
-  function addChapter() {
-    setChapters([...chapters, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`, time: "", title: "" }])
-  }
-
-  function updateChapter(id, field, value) {
-    setChapters(chapters.map((c) => (c.id === id ? { ...c, [field]: value } : c)))
-  }
-
-  function removeChapter(id) {
-    setChapters(chapters.filter((c) => c.id !== id))
   }
 
   function formatDate(unixSeconds) {
@@ -403,75 +380,14 @@ function App() {
             transcription modes; the X and settings panels drive themselves. */}
         {(inputMode === "file" || inputMode === "youtube") && (
         <>
-        {/* Voice selection */}
-        <div className="voice-picker">
-          <span className="voice-picker-label">Voz de la locución:</span>
-          <label className="voice-option">
-            <input
-              type="radio"
-              name="voice"
-              value="male"
-              checked={voice === "male"}
-              onChange={() => setVoice("male")}
-            />
-            Masculina
-          </label>
-          <label className="voice-option">
-            <input
-              type="radio"
-              name="voice"
-              value="female"
-              checked={voice === "female"}
-              onChange={() => setVoice("female")}
-            />
-            Femenina
-          </label>
-        </div>
+        <VoicePicker value={voice} onChange={setVoice} />
 
-        {/* Chapters (optional) */}
-        <details
-          className="chapters-editor"
+        <ChaptersEditor
+          chapters={chapters}
+          onChange={setChapters}
           open={showChapters}
           onToggle={(e) => setShowChapters(e.target.open)}
-        >
-          <summary>📑 Capítulos (opcional) {chapters.length > 0 && `· ${chapters.length}`}</summary>
-
-          <div className="chapters-list">
-            {chapters.map((ch) => (
-              <div key={ch.id} className="chapter-row-edit">
-                <input
-                  type="text"
-                  placeholder="00:00"
-                  value={ch.time}
-                  onChange={(e) => updateChapter(ch.id, "time", e.target.value)}
-                  className="chapter-time-input"
-                />
-                <input
-                  type="text"
-                  placeholder="Título del capítulo"
-                  value={ch.title}
-                  onChange={(e) => updateChapter(ch.id, "title", e.target.value)}
-                  className="chapter-title-input"
-                />
-                <button
-                  type="button"
-                  className="chapter-remove"
-                  onClick={() => removeChapter(ch.id)}
-                  aria-label="Eliminar capítulo"
-                >
-                  ✕
-                </button>
-              </div>
-            ))}
-          </div>
-
-          <button type="button" className="btn-add-chapter" onClick={addChapter}>
-            + Agregar capítulo
-          </button>
-          <p className="chapters-hint">
-            Formato: <code>MM:SS</code> o <code>H:MM:SS</code>, ej. <code>36:44</code> o <code>1:21:25</code>
-          </p>
-        </details>
+        />
 
         <button
           className="btn-primary"
@@ -505,10 +421,14 @@ function App() {
       {inputMode === "x" && (
         <XBookmarks
           onOpenJob={(jobId) => {
-            // Same pipeline, same results screen: switch to it rather than
-            // building a second viewer inside the bookmarks panel.
-            setInputMode("file")
+            // Same pipeline, same results screen -- and it already renders
+            // under whichever tab is open, so stay on X rather than dumping
+            // the user on the upload tab and losing their place in the list.
             openJob(jobId)
+            requestAnimationFrame(() =>
+              document.querySelector(".results, .status-message")
+                ?.scrollIntoView({ behavior: "smooth", block: "start" })
+            )
           }}
         />
       )}
@@ -831,14 +751,6 @@ function formatTs(ts) {
   if (m === 0 && s === 0) return `${sec.toFixed(1)}s`
   if (m > 0) return `${m}h ${s}m`
   return `${s}m ${Math.floor(sec)}s`
-}
-
-function parseTimeToSeconds(input) {
-  // "36:44" → 2204, "1:21:25" → 4885
-  const parts = input.split(":").map((p) => parseInt(p, 10) || 0)
-  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2]
-  if (parts.length === 2) return parts[0] * 60 + parts[1]
-  return parts[0] || 0
 }
 
 function groupByChapter(segments, chapters) {

@@ -167,6 +167,27 @@ def parse_srt(srt_text: str) -> list[dict]:
     return segments
 
 
+# ── Shared request parsing ──────────────────────────────────────────
+# Upload, YouTube and X all feed the same pipeline, so they take the same two
+# knobs and must reject bad input identically. Three copies of this drifted
+# apart the moment X was added.
+def _parse_chapters(chapters_json: Optional[str]) -> list[dict]:
+    """JSON: [{"time": 0, "title": "..."}, ...] -- absent means no chapters."""
+    if not chapters_json:
+        return []
+    try:
+        return json.loads(chapters_json)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid chapters JSON format")
+
+
+def _validated_voice(voice: str) -> str:
+    """Fail here rather than let Piper fail deep inside the job."""
+    if voice not in ("male", "female"):
+        raise HTTPException(400, "voice must be 'male' or 'female'")
+    return voice
+
+
 # ── Background worker ───────────────────────────────────────────────
 def _error_message(prefix: str, exc: Exception) -> str:
     return f"{prefix}: {exc}"
@@ -517,15 +538,8 @@ async def create_job(
     if not video.filename:
         raise HTTPException(400, "No filename provided")
 
-    chapters = []
-    if chapters_json:
-        try:
-            chapters = json.loads(chapters_json)
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Invalid chapters JSON format")
-
-    if voice not in ("male", "female"):
-        raise HTTPException(400, "voice must be 'male' or 'female'")
+    chapters = _parse_chapters(chapters_json)
+    voice = _validated_voice(voice)
 
     # Video is saved under the job's own id (not a separate random id) so
     # later stages (dubbing, chapter splitting) can find the source file
@@ -554,15 +568,8 @@ async def create_youtube_job(
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(400, "url must be an http(s) URL")
 
-    chapters = []
-    if chapters_json:
-        try:
-            chapters = json.loads(chapters_json)
-        except json.JSONDecodeError:
-            raise HTTPException(400, "Invalid chapters JSON format")
-
-    if voice not in ("male", "female"):
-        raise HTTPException(400, "voice must be 'male' or 'female'")
+    chapters = _parse_chapters(chapters_json)
+    voice = _validated_voice(voice)
 
     job_id = jobs.create_job(url, source="youtube", url=url)
     background_tasks.add_task(run_youtube_job, job_id, url, chapters, voice)
@@ -992,12 +999,18 @@ def _download_bookmark_worker(bm_id: int, tweet_url: str, cookies_path: str) -> 
 
 
 @app.post("/x/bookmarks/{id}/transcribe")
-async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks, voice: str = Form("male")):
+async def transcribe_x_bookmark(
+    id: int,
+    background_tasks: BackgroundTasks,
+    chapters_json: Optional[str] = Form(None),
+    voice: str = Form("male"),
+):
     """Run a downloaded bookmark video through the regular transcription pipeline.
 
     Same route every other source takes: the only thing X does differently is
-    where the file comes from. Returns the job id so the UI can jump straight to
-    it, exactly as uploading a file does.
+    where the file comes from, so it takes the same voice and chapter knobs.
+    Returns the job id so the UI can jump straight to it, exactly as uploading
+    a file does.
     """
     bm = xb.get_bookmark(id)
     if bm is None:
@@ -1005,12 +1018,15 @@ async def transcribe_x_bookmark(id: int, background_tasks: BackgroundTasks, voic
     if not bm.get("local_file_path"):
         raise HTTPException(409, "No local video file — download it first")
 
+    chapters = _parse_chapters(chapters_json)
+    voice = _validated_voice(voice)
+
     title = (bm.get("author") or "X") + " — " + (bm.get("text") or "")[:60]
     job_id = jobs.create_job(f"{title}.mp4", source="x", title=title, url=bm["tweet_url"])
     xb.set_job(id, job_id)
 
     background_tasks.add_task(
-        _transcribe_bookmark_worker, id, job_id, bm["local_file_path"], title, voice
+        _transcribe_bookmark_worker, id, job_id, bm["local_file_path"], title, chapters, voice
     )
     return {"ok": True, "job_id": job_id, "message": "Transcription started"}
 
@@ -1038,7 +1054,7 @@ def _place_for_pipeline(source: Path, destination: Path) -> None:
 
 
 def _transcribe_bookmark_worker(
-    bm_id: int, job_id: str, video_path: str, title: str, voice: str
+    bm_id: int, job_id: str, video_path: str, title: str, chapters: list[dict], voice: str
 ) -> None:
     """Hand a bookmark's video to the shared pipeline.
 
@@ -1064,13 +1080,16 @@ def _transcribe_bookmark_worker(
     # source_language=None: a tweet can be in any language, and the pipeline
     # already skips translation and dubbing when it detects Spanish.
     run_transcription_job(
-        job_id, local_path, f"{title}.mp4", [], voice,
+        job_id, local_path, f"{title}.mp4", chapters, voice,
         source_language=None, source="x", url=None,
     )
 
     finished = jobs.get_job(job_id) or {}
     status = "done" if finished.get("status") == "done" else "failed"
-    xb.mark_transcribed(bm_id, status, language=(finished.get("result") or {}).get("language"))
+    # 'source_language' is the key the pipeline actually writes (see the result
+    # dict in run_transcription_job); reading 'language' silently stored None.
+    language = (finished.get("result") or {}).get("source_language")
+    xb.mark_transcribed(bm_id, status, language=language)
     logger.info("x-transcribe worker finished for bookmark %s (job %s)", bm_id, job_id)
     x_progress.publish(
         {

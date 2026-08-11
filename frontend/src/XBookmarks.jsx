@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from "react"
+import VoicePicker from "./VoicePicker.jsx"
+import ChaptersEditor from "./ChaptersEditor.jsx"
+import { cleanChapters } from "./chapters.js"
+import { STAGE_LABELS } from "./stages.js"
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+const JOB_POLL_INTERVAL_MS = 2000
 
 const STATUS_FILTERS = [
   { label: "Todos", value: null },
@@ -48,6 +53,13 @@ function XBookmarks({ onOpenJob }) {
   const [downloadProgress, setDownloadProgress] = useState({})
   const [statusFilter, setStatusFilter] = useState(null)
   const [syncMessage, setSyncMessage] = useState("")
+  // Same two knobs the upload and YouTube tabs offer. They belong to the panel
+  // rather than to a card: you pick them, then transcribe whichever bookmarks.
+  const [voice, setVoice] = useState("male")
+  const [chapters, setChapters] = useState([])
+  const [showChapters, setShowChapters] = useState(false)
+  // {jobId: {stage, segments_done, segments_total}} for jobs still running.
+  const [jobStages, setJobStages] = useState({})
   const fileInputRef = useRef(null)
 
   // Refetch whenever the filter changes: calling refreshBookmarks() straight
@@ -134,6 +146,48 @@ function XBookmarks({ onOpenJob }) {
     return () => source.close()
   }, [])
 
+  // Which jobs are worth asking about: a bookmark that is mid-transcription.
+  const watchedKey = bookmarks
+    .filter((bm) => bm.job_id && transcribingIds.has(bm.id))
+    .map((bm) => bm.job_id)
+    .join(",")
+
+  // Stage of a running transcription, read from the job record the pipeline is
+  // already updating. Polling GET /jobs/{id} rather than teaching the pipeline
+  // to publish onto the X progress stream keeps the shared code unaware of X.
+  useEffect(() => {
+    if (!watchedKey) {
+      setJobStages({})
+      return
+    }
+
+    const jobIds = watchedKey.split(",")
+    let cancelled = false
+    let timer
+
+    async function tick() {
+      const entries = await Promise.all(
+        jobIds.map(async (jobId) => {
+          try {
+            const res = await fetch(`${API_URL}/jobs/${jobId}`)
+            return res.ok ? [jobId, await res.json()] : null
+          } catch {
+            return null // a blip here must not kill the poll loop
+          }
+        })
+      )
+      if (cancelled) return
+      setJobStages(Object.fromEntries(entries.filter(Boolean)))
+      timer = setTimeout(tick, JOB_POLL_INTERVAL_MS)
+    }
+
+    tick()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [watchedKey])
+
   async function refreshBookmarks() {
     setLoading(true)
     setError("")
@@ -211,7 +265,15 @@ function XBookmarks({ onOpenJob }) {
   async function transcribeBookmark(id) {
     setTranscribingIds((prev) => new Set(prev).add(id))
     try {
-      const res = await fetch(`${API_URL}/x/bookmarks/${id}/transcribe`, { method: "POST" })
+      const formData = new FormData()
+      formData.append("voice", voice)
+      const cleaned = cleanChapters(chapters)
+      if (cleaned.length) formData.append("chapters_json", JSON.stringify(cleaned))
+
+      const res = await fetch(`${API_URL}/x/bookmarks/${id}/transcribe`, {
+        method: "POST",
+        body: formData,
+      })
       const body = await res.json()
       if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
       refreshBookmarks()
@@ -260,6 +322,18 @@ function XBookmarks({ onOpenJob }) {
           {syncing ? "Sincronizando…" : "🔄 Sync Bookmarks"}
         </button>
         {syncMessage && <span className="sync-message">{syncMessage}</span>}
+      </section>
+
+      {/* The same knobs the other two sources offer, applied to whichever
+          bookmark you transcribe next. */}
+      <section className="x-job-options">
+        <VoicePicker value={voice} onChange={setVoice} />
+        <ChaptersEditor
+          chapters={chapters}
+          onChange={setChapters}
+          open={showChapters}
+          onToggle={(e) => setShowChapters(e.target.open)}
+        />
       </section>
 
       {/* Filter bar */}
@@ -317,6 +391,16 @@ function XBookmarks({ onOpenJob }) {
                     {Math.round(downloadProgress[bm.id].percent)}%
                     {downloadProgress[bm.id].size && ` de ${downloadProgress[bm.id].size}`}
                     {downloadProgress[bm.id].speed && ` · ${downloadProgress[bm.id].speed}`}
+                  </span>
+                </div>
+              )}
+              {jobStages[bm.job_id] && jobStages[bm.job_id].status === "running" && (
+                <div className="bookmark-stage">
+                  <span className="spinner"></span>
+                  <span className="bookmark-stage-label">
+                    {STAGE_LABELS[jobStages[bm.job_id].stage] ?? "Procesando…"}
+                    {jobStages[bm.job_id].segments_total > 0 &&
+                      ` · ${jobStages[bm.job_id].segments_done}/${jobStages[bm.job_id].segments_total}`}
                   </span>
                 </div>
               )}

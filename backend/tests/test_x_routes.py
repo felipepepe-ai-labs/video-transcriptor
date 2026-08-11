@@ -378,6 +378,82 @@ def test_the_language_is_auto_detected(client, pipeline, tmp_path):
     assert kwargs["source_language"] is None
 
 
+# The three sources share one pipeline, so they must also share the knobs that
+# drive it: picking a voice and supplying chapters cannot be a privilege of the
+# upload and YouTube tabs.
+
+def test_the_chosen_voice_reaches_the_pipeline(client, pipeline, tmp_path):
+    row_id, _ = _downloaded(tmp_path)
+
+    client.post(f"/x/bookmarks/{row_id}/transcribe", data={"voice": "female"})
+
+    args, _ = pipeline[0]
+    assert args[4] == "female"
+
+
+def test_the_voice_defaults_to_male(client, pipeline, tmp_path):
+    row_id, _ = _downloaded(tmp_path)
+
+    client.post(f"/x/bookmarks/{row_id}/transcribe")
+
+    args, _ = pipeline[0]
+    assert args[4] == "male"
+
+
+def test_an_unknown_voice_is_refused(client, pipeline, tmp_path):
+    """Same 400 the other two sources give, rather than a Piper failure later."""
+    row_id, _ = _downloaded(tmp_path)
+
+    response = client.post(f"/x/bookmarks/{row_id}/transcribe", data={"voice": "robot"})
+
+    assert response.status_code == 400
+    assert not pipeline
+
+
+def test_chapters_reach_the_pipeline(client, pipeline, tmp_path):
+    row_id, _ = _downloaded(tmp_path)
+
+    client.post(
+        f"/x/bookmarks/{row_id}/transcribe",
+        data={"chapters_json": '[{"time": 0, "title": "Intro"}]'},
+    )
+
+    args, _ = pipeline[0]
+    assert args[3] == [{"time": 0, "title": "Intro"}]
+
+
+def test_malformed_chapters_json_is_refused(client, pipeline, tmp_path):
+    row_id, _ = _downloaded(tmp_path)
+
+    response = client.post(
+        f"/x/bookmarks/{row_id}/transcribe", data={"chapters_json": "not json"}
+    )
+
+    assert response.status_code == 400
+    assert not pipeline
+
+
+def test_the_detected_language_is_recorded_on_the_bookmark(client, monkeypatch, tmp_path):
+    """The pipeline stores the key as 'source_language'; reading 'language'
+    silently wrote None for every bookmark ever transcribed."""
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    monkeypatch.setattr(app_module, "UPLOAD_DIR", uploads)
+
+    def finish(job_id, *args, **kwargs):
+        jobs.update_job(
+            job_id, status="done", stage="done",
+            result={"source_language": "en", "segments": []},
+        )
+
+    monkeypatch.setattr(app_module, "run_transcription_job", finish)
+    row_id, _ = _downloaded(tmp_path)
+
+    client.post(f"/x/bookmarks/{row_id}/transcribe")
+
+    assert xb.get_bookmark(row_id)["transcript_language"] == "en"
+
+
 def test_transcribing_an_undownloaded_bookmark_is_refused(client, pipeline):
     row_id = _add(status="interesting")
 
