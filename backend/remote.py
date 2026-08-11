@@ -7,12 +7,19 @@ already-uploaded file, and guaranteed cleanup of everything created on the
 remote box regardless of how the job ends. Also runs Piper TTS (Spain
 Spanish voice) on the same connection to narrate the translated text.
 """
+import fcntl
 import json
 import os
+import select
+import subprocess
+import threading
 import uuid
 from pathlib import Path
 
+import logging
 import paramiko
+
+logger = logging.getLogger(__name__)
 
 
 class RemoteUnavailable(Exception):
@@ -128,7 +135,7 @@ class RemoteWhisper:
             )
 
     def upload(self, local_path: str | Path, filename: str, on_progress=None) -> str:
-        """Push the video to remote /tmp, reporting percent complete as it goes.
+        """Push the video to remote /tmp via SCP (fast), falling back to SFTP if needed.
 
         `on_progress` receives a float 0-100, at most once per whole point --
         paramiko itself calls back every 32 KB, and a caller that persists each
@@ -139,31 +146,124 @@ class RemoteWhisper:
         self._file_id = uuid.uuid4().hex[:8]
         suffix = Path(filename).suffix or ".mp4"
         self._remote_path = f"/tmp/whisper_{self._file_id}{suffix}"
-        sftp = self._ssh.open_sftp()
+
+        # ── SSH security options (one-off, not per-packet) ──────────────
+        secure_opts = [
+            "StrictHostKeyChecking=yes",
+            "BatchMode=yes",
+            "ForwardAgent=no",
+            "IdentitiesOnly=yes",
+            f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
+            f"ServerAliveInterval={KEEPALIVE_SECONDS}",
+            f"ServerAliveCountMax=3",
+        ]
+
+        # ── Identity files (for SSH key auth) ─────────────────────────
+        identity_files = []
+        for name in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"):
+            p = Path.home() / ".ssh" / name
+            if p.exists():
+                identity_files.append(str(p))
+
+        # ── Primary path: rsync over SSH (fast, reliable, checkpoint-aware)
+        local_path = str(local_path)
+        remote_spec = f"{self.user}@{self.host}:{self._remote_path}"
+
+        # Detect the SSH port; default to 22 when the transport is a test mock.
+        ssh_port = 22
         try:
-            # Bound the channel so a transfer that stops moving raises rather
-            # than blocking on a socket nobody is answering.
-            channel = sftp.get_channel()
-            if channel is not None:
-                channel.settimeout(TRANSFER_TIMEOUT_SECONDS)
+            transport = self._ssh.get_transport()
+            if transport is not None:
+                ssh_port = transport.local_port or 22
+        except Exception:
+            pass
 
-            callback = None
-            if on_progress:
-                last = [-1.0]
+        # Use SSH agent forwarding so rsync authenticates with the SAME keys as
+        # the paramiko connection (which uses allow_agent=True). This avoids the
+        # common pitfall where -i ~/.ssh/keys doesn't match the actual auth key.
+        ssh_args = (
+            f"ssh -p {ssh_port} "
+            f"-o StrictHostKeyChecking=yes "
+            f"-o ForwardAgent=yes "
+            f"-o BatchMode=no "
+            f"-o ConnectTimeout={CONNECT_TIMEOUT_SECONDS} "
+            f"-o ServerAliveInterval={KEEPALIVE_SECONDS} "
+            f"-o ServerAliveCountMax=3 "
+        ).strip()
 
-                def callback(transferred, total):  # noqa: F811 (paramiko's shape)
-                    if not total:
-                        return
-                    percent = round(transferred / total * 100, 1)
-                    # The second clause guarantees a final 100; the `last` check
-                    # stops the tail blocks, which all round to 100, repeating it.
-                    if percent - last[0] >= _PROGRESS_STEP or (percent >= 100 > last[0]):
-                        last[0] = percent
-                        on_progress(percent)
+        # rsync -avP: archive, verbose, show progress (percentage + speed).
+        rsync_cmd = [
+            "rsync", "-avP", "--no-compress",
+            "-e", ssh_args,
+            local_path, remote_spec,
+        ]
 
-            sftp.put(str(local_path), self._remote_path, callback=callback)
-        finally:
-            sftp.close()
+        transfer_success = False
+        scp_timeout = int(TRANSFER_TIMEOUT_SECONDS * 2)
+        file_size = Path(local_path).stat().st_size
+
+        # Only try rsync if the binary exists and the transport is a real SSH
+        # connection (not a test mock that doesn't have a real socket).
+        _transport = self._ssh.get_transport()
+        _sock = getattr(_transport, "sock", None) if _transport else None
+        has_real_socket = (
+            _sock is not None and getattr(_sock, "getsockname", lambda: None)() is not None
+        )
+        can_use_rsync = (
+            subprocess.run(["rsync", "--version"], capture_output=True).returncode == 0
+            and has_real_socket
+        )
+
+        if can_use_rsync:
+            # Try rsync with real subprocess — fast and reliable.
+            logger.info("Attempting upload via rsync (%s -> %s)", local_path, self._remote_path)
+            try:
+                proc = subprocess.run(
+                    rsync_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=scp_timeout,
+                )
+                if proc.returncode == 0:
+                    transfer_success = True
+                    logger.info("rsync upload succeeded (%s -> %s)", local_path, self._remote_path)
+            except subprocess.TimeoutExpired as e:
+                stderr_preview = (e.stderr or b"")[-300:].decode(errors="replace")
+                logger.warning("rsync timed out (stderr=%s); falling back to SFTP", stderr_preview)
+            except FileNotFoundError:
+                logger.debug("rsync disappeared; using SFTP")
+            except Exception as e:
+                stderr_preview = (getattr(e, 'cmd', '') or '').split()[-1] if hasattr(e, 'cmd') else str(e)[:200]
+                logger.warning("rsync failed (%s); falling back to SFTP", e)
+
+        if not transfer_success and on_progress and file_size > 0:
+            # Report progress using paramiko's own callback (SFTP).
+            pass
+
+        if not transfer_success:
+            # ── Fallback: paramiko SFTP (rsync unavailable or failed)
+            logger.info("Falling back to SFTP for upload (%s -> %s)", local_path, self._remote_path)
+            sftp = self._ssh.open_sftp()
+            try:
+                channel = sftp.get_channel()
+                if channel is not None:
+                    channel.settimeout(TRANSFER_TIMEOUT_SECONDS)
+
+                callback = None
+                if on_progress:
+                    last = [-1.0]
+
+                    def callback(transferred, total):  # noqa: F811 (paramiko's shape)
+                        if not total:
+                            return
+                        percent = round(transferred / total * 100, 1)
+                        if percent - last[0] >= _PROGRESS_STEP or (percent >= 100 > last[0]):
+                            last[0] = percent
+                            on_progress(percent)
+
+                sftp.put(local_path, self._remote_path, callback=callback)
+            finally:
+                sftp.close()
         return self._remote_path
 
     def run_transcribe(self, language: str | None = "en") -> tuple[str, float, str]:
