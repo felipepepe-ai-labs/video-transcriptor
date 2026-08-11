@@ -1270,3 +1270,14 @@ header p {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;  /* stops the % jittering as it counts */
 }
+
+/* The shared .btn-primary is sized for the main "Transcribir" call to action.
+   In this toolbar it dwarfed the button beside it, so it keeps the emphasis
+   (filled background) at the size of its neighbours. */
+.x-import-section .btn-primary {
+  align-self: auto;
+  padding: 0.4rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  border-radius: 0.4rem;
+}
