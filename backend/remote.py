@@ -8,10 +8,15 @@ remote box regardless of how the job ends. Also runs Piper TTS (Spain
 Spanish voice) on the same connection to narrate the translated text.
 """
 import fcntl
+import io
 import json
 import os
+import queue
+import re
 import select
+import shutil
 import subprocess
+import tarfile
 import threading
 import uuid
 from pathlib import Path
@@ -24,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 class RemoteUnavailable(Exception):
     """SSH connection to the remote host failed or was refused."""
+
+
+class UploadFailed(RemoteUnavailable):
+    """rsync could not put the file on the remote box.
+
+    Subclasses RemoteUnavailable so callers that already treat "the remote is
+    not usable" as one case keep working, while anything that cares can tell an
+    upload apart from a refused connection.
+    """
 
 
 class InsufficientRemoteStorage(Exception):
@@ -47,14 +61,18 @@ class TTSFailed(Exception):
 CONNECT_TIMEOUT_SECONDS = 15  # TCP connect to the remote box
 BANNER_TIMEOUT_SECONDS = 20  # SSH banner, slow to arrive on a loaded host
 AUTH_TIMEOUT_SECONDS = 20  # key exchange and auth
-TRANSFER_TIMEOUT_SECONDS = 120  # no bytes moving on the SFTP channel for this long
+TRANSFER_TIMEOUT_SECONDS = 120  # rsync saying nothing at all for this long
 # Keepalive is what turns a link that silently died into an exception: without
 # it TCP alone can sit on a dead socket for hours before giving up.
 KEEPALIVE_SECONDS = 30
 
-# One progress report per whole percentage point. paramiko calls back roughly
-# every 32 KB, which for a 681 MB file would be ~21,000 SQLite writes.
+# One progress report per whole percentage point. rsync repaints its progress
+# line many times a second, which for a 681 MB file would be thousands of
+# SQLite writes.
 _PROGRESS_STEP = 1.0
+
+# The percentage out of `rsync --info=progress2`, e.g. "1,234,567  45%  11MB/s".
+_RSYNC_PERCENT = re.compile(r"(\d{1,3})%")
 
 VOICE_PRESETS = {
     "male": {"model": "es_ES-davefx-medium", "speaker": None},
@@ -134,12 +152,23 @@ class RemoteWhisper:
                 f"({file_size_bytes} bytes x {self.disk_safety_margin} safety margin)"
             )
 
-    def upload(self, local_path: str | Path, filename: str, on_progress=None) -> str:
-        """Push the video to remote /tmp via SCP (fast), falling back to SFTP if needed.
+    def upload(
+        self,
+        local_path: str | Path,
+        filename: str,
+        on_progress=None,
+        stall_timeout: float = TRANSFER_TIMEOUT_SECONDS,
+    ) -> str:
+        """Push the video to remote /tmp with rsync over SSH.
+
+        rsync is the only transfer path, deliberately: the one it replaced
+        (SFTP) is exactly what wedged on a 681 MB file, and a second path is a
+        second thing to keep timing out correctly. `scp` is not an alternative
+        either -- since OpenSSH 9.0 it speaks the SFTP protocol underneath.
 
         `on_progress` receives a float 0-100, at most once per whole point --
-        paramiko itself calls back every 32 KB, and a caller that persists each
-        one would write to SQLite thousands of times per upload.
+        rsync repaints its progress line constantly, and a caller that persists
+        every repaint would write to SQLite thousands of times per upload.
         """
         if self._ssh is None:
             self.connect()
@@ -147,123 +176,93 @@ class RemoteWhisper:
         suffix = Path(filename).suffix or ".mp4"
         self._remote_path = f"/tmp/whisper_{self._file_id}{suffix}"
 
-        # ── SSH security options (one-off, not per-packet) ──────────────
-        secure_opts = [
-            "StrictHostKeyChecking=yes",
-            "BatchMode=yes",
-            "ForwardAgent=no",
-            "IdentitiesOnly=yes",
-            f"ConnectTimeout={CONNECT_TIMEOUT_SECONDS}",
-            f"ServerAliveInterval={KEEPALIVE_SECONDS}",
-            f"ServerAliveCountMax=3",
-        ]
+        if shutil.which("rsync") is None:
+            raise UploadFailed(
+                "rsync is not installed and it is the only upload path "
+                "(apt install rsync)"
+            )
 
-        # ── Identity files (for SSH key auth) ─────────────────────────
-        identity_files = []
-        for name in ("id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"):
-            p = Path.home() / ".ssh" / name
-            if p.exists():
-                identity_files.append(str(p))
-
-        # ── Primary path: rsync over SSH (fast, reliable, checkpoint-aware)
         local_path = str(local_path)
         remote_spec = f"{self.user}@{self.host}:{self._remote_path}"
 
-        # Detect the SSH port; default to 22 when the transport is a test mock.
-        ssh_port = 22
-        try:
-            transport = self._ssh.get_transport()
-            if transport is not None:
-                ssh_port = transport.local_port or 22
-        except Exception:
-            pass
-
-        # Use SSH agent forwarding so rsync authenticates with the SAME keys as
-        # the paramiko connection (which uses allow_agent=True). This avoids the
-        # common pitfall where -i ~/.ssh/keys doesn't match the actual auth key.
+        # BatchMode=yes turns a bad key into an error instead of a hang: without
+        # it ssh sits on a password prompt that nothing can answer from a
+        # subprocess with no TTY.
         ssh_args = (
-            f"ssh -p {ssh_port} "
-            f"-o StrictHostKeyChecking=yes "
-            f"-o ForwardAgent=yes "
-            f"-o BatchMode=no "
+            "ssh -o StrictHostKeyChecking=yes "
+            "-o BatchMode=yes "
             f"-o ConnectTimeout={CONNECT_TIMEOUT_SECONDS} "
             f"-o ServerAliveInterval={KEEPALIVE_SECONDS} "
-            f"-o ServerAliveCountMax=3 "
-        ).strip()
+            "-o ServerAliveCountMax=3"
+        )
 
-        # rsync -avP: archive, verbose, show progress (percentage + speed).
-        rsync_cmd = [
-            "rsync", "-avP", "--no-compress",
+        # --info=progress2 reports one running total for the transfer as a
+        # whole. --no-compress because video is already compressed: deflating it
+        # again only burns CPU this box does not have to spare.
+        cmd = [
+            "rsync", "-a", "--no-compress", "--info=progress2",
             "-e", ssh_args,
             local_path, remote_spec,
         ]
 
-        transfer_success = False
-        scp_timeout = int(TRANSFER_TIMEOUT_SECONDS * 2)
-        file_size = Path(local_path).stat().st_size
-
-        # Only try rsync if the binary exists and the transport is a real SSH
-        # connection (not a test mock that doesn't have a real socket).
-        _transport = self._ssh.get_transport()
-        _sock = getattr(_transport, "sock", None) if _transport else None
-        has_real_socket = (
-            _sock is not None and getattr(_sock, "getsockname", lambda: None)() is not None
-        )
-        can_use_rsync = (
-            subprocess.run(["rsync", "--version"], capture_output=True).returncode == 0
-            and has_real_socket
+        logger.info("rsync uploading %s -> %s", local_path, self._remote_path)
+        # Popen rather than run(): run() only hands back output once the process
+        # is over, so there would be nothing to report while 681 MB go up.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,  # universal newlines, so rsync's \r repaints read as lines
+            bufsize=1,
         )
 
-        if can_use_rsync:
-            # Try rsync with real subprocess — fast and reliable.
-            logger.info("Attempting upload via rsync (%s -> %s)", local_path, self._remote_path)
+        # A reader thread does the blocking so this one can wait on a queue it
+        # *can* put a deadline on -- same shape as x_sync.download_video().
+        lines: queue.Queue = queue.Queue()
+
+        def pump() -> None:
             try:
-                proc = subprocess.run(
-                    rsync_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=scp_timeout,
-                )
-                if proc.returncode == 0:
-                    transfer_success = True
-                    logger.info("rsync upload succeeded (%s -> %s)", local_path, self._remote_path)
-            except subprocess.TimeoutExpired as e:
-                stderr_preview = (e.stderr or b"")[-300:].decode(errors="replace")
-                logger.warning("rsync timed out (stderr=%s); falling back to SFTP", stderr_preview)
-            except FileNotFoundError:
-                logger.debug("rsync disappeared; using SFTP")
-            except Exception as e:
-                stderr_preview = (getattr(e, 'cmd', '') or '').split()[-1] if hasattr(e, 'cmd') else str(e)[:200]
-                logger.warning("rsync failed (%s); falling back to SFTP", e)
-
-        if not transfer_success and on_progress and file_size > 0:
-            # Report progress using paramiko's own callback (SFTP).
-            pass
-
-        if not transfer_success:
-            # ── Fallback: paramiko SFTP (rsync unavailable or failed)
-            logger.info("Falling back to SFTP for upload (%s -> %s)", local_path, self._remote_path)
-            sftp = self._ssh.open_sftp()
-            try:
-                channel = sftp.get_channel()
-                if channel is not None:
-                    channel.settimeout(TRANSFER_TIMEOUT_SECONDS)
-
-                callback = None
-                if on_progress:
-                    last = [-1.0]
-
-                    def callback(transferred, total):  # noqa: F811 (paramiko's shape)
-                        if not total:
-                            return
-                        percent = round(transferred / total * 100, 1)
-                        if percent - last[0] >= _PROGRESS_STEP or (percent >= 100 > last[0]):
-                            last[0] = percent
-                            on_progress(percent)
-
-                sftp.put(local_path, self._remote_path, callback=callback)
+                for line in proc.stdout:
+                    lines.put(line)
             finally:
-                sftp.close()
+                lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+
+        last = -1.0
+        output: list[str] = []
+        try:
+            while True:
+                try:
+                    line = lines.get(timeout=stall_timeout)
+                except queue.Empty:
+                    # Kill rather than abandon it: an orphaned rsync would keep
+                    # pushing bytes at a box we have given up on.
+                    proc.kill()
+                    raise UploadFailed(
+                        f"rsync stalled: no output for {stall_timeout}s "
+                        f"uploading {local_path}"
+                    )
+                if line is None:
+                    break
+                output.append(line)
+                if on_progress:
+                    found = _RSYNC_PERCENT.search(line)
+                    if found:
+                        percent = float(found.group(1))
+                        if percent - last >= _PROGRESS_STEP or (percent >= 100 > last):
+                            last = percent
+                            on_progress(percent)
+            proc.wait(timeout=stall_timeout)
+        finally:
+            proc.stdout.close()
+
+        if proc.returncode != 0:
+            raise UploadFailed(
+                f"rsync exited {proc.returncode}: {''.join(output).strip()[-500:]}"
+            )
+
+        logger.info("rsync upload finished (%s)", self._remote_path)
         return self._remote_path
 
     def run_transcribe(self, language: str | None = "en") -> tuple[str, float, str]:
@@ -326,18 +325,22 @@ class RemoteWhisper:
             err_txt = stderr.read().decode(errors="replace")
             raise TTSFailed(f"Piper batch failed (exit {exit_code}): {(err_txt or out_txt)[-500:]}")
 
-        sftp = self._ssh.open_sftp()
-        try:
-            filenames = sorted(attr.filename for attr in sftp.listdir_attr(out_dir))
-            if len(filenames) != len(chunk):
-                raise TTSFailed(f"Piper produced {len(filenames)} files for {len(chunk)} input lines")
-            audio: list[bytes] = []
-            for fn in filenames:
-                with sftp.open(f"{out_dir}/{fn}", "rb") as f:
-                    audio.append(f.read())
-            return audio
-        finally:
-            sftp.close()
+        # One tar down the exec channel rather than a file-by-file download: the
+        # channel is already open and authenticated, and a chunk's WAVs are read
+        # into memory either way. No -z: PCM barely deflates and the CPU cost
+        # lands on the box that can least afford it.
+        _, out_tar, _ = self._ssh.exec_command(f"tar -cf - -C {out_dir} .")
+        with tarfile.open(fileobj=io.BytesIO(out_tar.read())) as tf:
+            # Piper writes with --output-dir-naming timestamp, so ordering by
+            # name is what puts the clips back in the order their text went in.
+            members = sorted(
+                (m for m in tf.getmembers() if m.isfile()), key=lambda m: m.name
+            )
+            if len(members) != len(chunk):
+                raise TTSFailed(
+                    f"Piper produced {len(members)} files for {len(chunk)} input lines"
+                )
+            return [tf.extractfile(m).read() for m in members]
 
     def cleanup(self) -> None:
         """Guaranteed cleanup: remove uploaded file + all output dirs on the remote box."""
@@ -383,15 +386,12 @@ class RemoteWhisper:
                 f"Whisper failed (exit {exit_code}): {(err_txt or out_txt)[-500:]}"
             )
 
-        remote_srt = None
-        sftp = self._ssh.open_sftp()
-        try:
-            for attr in sftp.listdir_attr(out_dir):
-                if attr.filename.endswith(".srt"):
-                    remote_srt = f"{out_dir}/{attr.filename}"
-                    break
-        finally:
-            sftp.close()
+        # whisper writes one SRT per run, so the first match is the one.
+        # 2>/dev/null keeps a missing directory quiet: the empty result is
+        # already the error path, just below.
+        _, out_ls, _ = self._ssh.exec_command(f"ls -1 {out_dir}/*.srt 2>/dev/null")
+        listing = [n for n in out_ls.read().decode(errors="replace").splitlines() if n.strip()]
+        remote_srt = listing[0] if listing else None
 
         if not remote_srt:
             raise TranscriptionFailed("No SRT file generated by Whisper")

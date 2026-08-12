@@ -26,8 +26,14 @@ MAX_SLUG = 60
 _FALLBACK = "video"
 
 
-def slugify(text: str, max_len: int = MAX_SLUG) -> str:
-    """Lowercase ASCII words joined by hyphens, safe on every filesystem."""
+def slugify(text: str, max_len: int = MAX_SLUG, fallback: str = _FALLBACK) -> str:
+    """Lowercase ASCII words joined by hyphens, safe on every filesystem.
+
+    *fallback* names what an unusable input becomes — a handle written entirely
+    in kanji leaves nothing behind once the non-ASCII bytes are dropped, and
+    calling that "video" would only be right for the media files this was
+    written for.
+    """
     # NFKD splits 'ü' into 'u' + combining diaeresis, and dropping the
     # non-ASCII bytes then leaves the plain letter rather than losing the word.
     normalized = unicodedata.normalize("NFKD", text)
@@ -36,7 +42,7 @@ def slugify(text: str, max_len: int = MAX_SLUG) -> str:
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", ascii_only).strip("-").lower()
     if len(slug) > max_len:
         slug = slug[:max_len].rstrip("-")
-    return slug or _FALLBACK
+    return slug or fallback
 
 
 def media_name(job_id: str, title: str, suffix: str) -> str:

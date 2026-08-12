@@ -47,10 +47,20 @@ def client(tmp_path, monkeypatch):
     return TestClient(app_module.app)
 
 
-def _add(url="https://x.com/a/status/1", status="new"):
+def _add(url="https://x.com/a/status/1", status="new", **fields):
+    """Insert a bookmark. Extra columns go in as keyword arguments.
+
+    It used to accept only the url and the status, which is precisely why no
+    test ever noticed that the listing was dropping `text`, `expanded_text` and
+    `job_id`: the rows it produced had nothing in those columns to lose.
+    """
+    cols = ["tweet_url", "status", *fields]
+    values = [url, status, *fields.values()]
     conn = xb._get_conn()
     cur = conn.execute(
-        "INSERT INTO bookmarks (tweet_url, status) VALUES (?, ?)", (url, status)
+        f"INSERT INTO bookmarks ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' for _ in values)})",
+        values,
     )
     conn.commit()
     row_id = cur.lastrowid
@@ -78,6 +88,69 @@ def test_list_filters_by_status(client):
     response = client.get("/x/bookmarks", params={"status": "interesting"})
 
     assert [b["tweet_url"] for b in response.json()] == ["https://x.com/b/status/2"]
+
+
+def test_list_carries_the_text_the_scraper_worked_to_expand(client):
+    """The whole point of the permalink second pass is to end up on screen."""
+    _add(text="the timeline version", expanded_text="the whole 2341-char thing")
+
+    [bookmark] = client.get("/x/bookmarks").json()
+
+    assert bookmark["text"] == "the timeline version"
+    assert bookmark["expanded_text"] == "the whole 2341-char thing"
+
+
+def test_list_carries_the_fields_the_card_makes_decisions_with(client):
+    """job_id drives three separate branches in XBookmarks.jsx.
+
+    Without it the 'view transcription' button never renders at all, and the
+    'transcribe' button offers to re-run a pipeline that already ran.
+    """
+    _add(status="downloaded", job_id="abc123", has_media=1, transcription_status="done")
+
+    [bookmark] = client.get("/x/bookmarks").json()
+
+    assert bookmark["job_id"] == "abc123"
+    assert bookmark["has_media"] == 1
+    assert bookmark["transcription_status"] == "done"
+
+
+def test_the_detail_route_returns_the_whole_row(client):
+    row_id = _add(expanded_text="everything", article_content="<p>the article</p>")
+
+    bookmark = client.get(f"/x/bookmarks/{row_id}").json()
+
+    assert bookmark["expanded_text"] == "everything"
+    assert bookmark["article_content"] == "<p>the article</p>"
+
+
+def test_the_detail_route_404s_for_an_unknown_bookmark(client):
+    assert client.get("/x/bookmarks/999999").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+def test_export_writes_the_backup_and_says_what_it_wrote(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module.x_export, "backup_dir", lambda: tmp_path / "backup")
+    _add(text="something worth keeping")
+
+    body = client.post("/x/export").json()
+
+    assert body["markdown"] == 1
+    assert (tmp_path / "backup" / "bookmarks.json").exists()
+
+
+def test_a_failed_backup_does_not_take_down_a_good_sync(monkeypatch, caplog):
+    """An unplugged NAS must not undo a scrape that already worked."""
+    def explode():
+        raise OSError("no such device")
+
+    monkeypatch.setattr(app_module.x_export, "backup_dir", explode)
+
+    # Must not raise: the sync's own result is the thing being protected.
+    app_module._export_bookmarks_quietly()
 
 
 def test_toggle_marks_a_bookmark_interesting(client):

@@ -42,6 +42,7 @@ def test_every_media_directory_hangs_off_the_root(monkeypatch):
         "audio": Path("/mnt/big-disk/vt/audio"),
         "video": Path("/mnt/big-disk/vt/video"),
         "x_downloads": Path("/mnt/big-disk/vt/x-downloads"),
+        "x_backup": Path("/mnt/big-disk/vt/x-backup"),
     }
 
 

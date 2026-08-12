@@ -22,6 +22,7 @@ import dub
 import jobs
 import media_names
 import x_bookmarks as xb
+import x_export
 import youtube
 from x_sync import (
     import_cookies as _import_cookies,
@@ -1053,6 +1054,10 @@ def _sync_x_bookmarks_worker(session_path: str) -> None:
         return
 
     logger.info("x-sync worker finished, %d bookmarks synced", len(scraped))
+    # Every successful scrape refreshes the plain-file copy, so the backup is
+    # never staler than the last sync and nobody has to remember to press a
+    # button for it.
+    _export_bookmarks_quietly()
     x_progress.publish(
         {
             "type": "done",
@@ -1069,6 +1074,44 @@ async def list_x_bookmarks(status: str | None = None):
     """List all X bookmarks. Optionally filter by status (new, interesting, downloaded)."""
     import x_bookmarks as xb
     return xb.list_bookmarks(status_filter=status)
+
+
+@app.post("/x/export")
+async def export_x_bookmarks():
+    """Write the whole bookmarks store out as JSON + one Markdown per bookmark.
+
+    Not a background task: this is a few dozen rows of text, and the caller
+    wants to be told how many files it got.
+    """
+    try:
+        return x_export.export_bookmarks()
+    except OSError as e:
+        # Almost always DATA_ROOT pointing at an unmounted disk.
+        raise HTTPException(500, f"no se pudo escribir el backup: {e}")
+
+
+def _export_bookmarks_quietly() -> None:
+    """Refresh the backup after a sync, without ever failing the sync.
+
+    The scrape is the expensive part — three minutes of navigation — and a
+    backup that cannot be written is not a reason to throw it away. Same
+    degradation contract as narration and dubbing in the video pipeline.
+    """
+    try:
+        result = x_export.export_bookmarks()
+        logger.info("backup refreshed: %s markdown file(s)", result["markdown"])
+    except Exception:
+        logger.warning("could not refresh the bookmarks backup", exc_info=True)
+
+
+@app.get("/x/bookmarks/{id}")
+async def get_x_bookmark(id: int):
+    """One bookmark with every column, including the ones the listing leaves out."""
+    import x_bookmarks as xb
+    bm = xb.get_bookmark(id)
+    if bm is None:
+        raise HTTPException(404, "Bookmark not found")
+    return bm
 
 
 @app.patch("/x/bookmarks/{id}/interesting")

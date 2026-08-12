@@ -42,7 +42,7 @@ def test_config_lists_the_resolved_directories(client):
     """The panel shows real paths rather than guessing at them."""
     dirs = client.get("/config").json()["directories"]
 
-    assert set(dirs) == {"uploads", "audio", "video", "x_downloads"}
+    assert set(dirs) == {"uploads", "audio", "video", "x_downloads", "x_backup"}
 
 
 def test_saving_a_setting_takes_effect(client, tmp_path):
