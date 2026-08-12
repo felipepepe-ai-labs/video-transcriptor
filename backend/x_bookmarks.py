@@ -141,9 +141,19 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
             continue
         cols = ", ".join(row.keys())
         placeholders = ", ".join("?" for _ in row)
-        # INSERT OR IGNORE skips duplicates; we never update scraped fields.
+        # A known URL is left alone except for one field: `expanded_text`, which
+        # the scraper only learned to fetch later, so every row stored before
+        # that carries the ~280-char version the timeline truncates to. Without
+        # this backfill `INSERT OR IGNORE` would keep them truncated for ever.
+        #
+        # The WHERE is what makes it safe to re-run: a permalink that failed
+        # yields NULL, and NULL must never overwrite text already captured.
+        # Nothing else is touched -- status, local_file_path and job_id are the
+        # user's curation, and a re-sync has no business undoing it.
         conn.execute(
-            f"INSERT OR IGNORE INTO bookmarks ({cols}) VALUES ({placeholders})",
+            f"INSERT INTO bookmarks ({cols}) VALUES ({placeholders}) "
+            "ON CONFLICT(tweet_url) DO UPDATE SET expanded_text = excluded.expanded_text "
+            "WHERE excluded.expanded_text IS NOT NULL",
             list(row.values()),
         )
     conn.commit()

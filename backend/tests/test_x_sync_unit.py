@@ -500,3 +500,149 @@ def test_an_unrecognised_failure_keeps_its_original_text():
     message = x_sync._explain_scrape_failure([], RuntimeError("browser vanished"))
 
     assert "browser vanished" in message
+
+
+# ---------------------------------------------------------------------------
+# Collecting through a virtualised timeline
+#
+# X unmounts tweet cards that scroll far from the viewport, so the DOM never
+# holds the whole list at once. A single extraction at the end therefore keeps
+# only whatever survived the last scroll -- the OLDEST bookmarks. Against the
+# real account that was 4 of 33.
+# ---------------------------------------------------------------------------
+
+class FakeTimeline:
+    """A timeline that renders a different slice of tweets on every round.
+
+    Unlike `FakePage`, `evaluate` here also answers the `_extract_tweets` shape,
+    which is what makes the virtualisation observable: `rounds[i]` is all that
+    exists in the DOM during round i, and earlier slices are gone for good.
+    """
+
+    def __init__(self, rounds, heights=None):
+        self.rounds = [list(r) for r in rounds]
+        self.index = 0
+        # Enough equal heights to trip the stability counter and stop.
+        self.heights = list(heights or [100] * (len(rounds) + 4))
+        self.goto_calls = []
+
+    @property
+    def _current(self):
+        return self.rounds[min(self.index, len(self.rounds) - 1)]
+
+    def evaluate(self, script):
+        if "scrollTo" in script:
+            self.index += 1
+            return None
+        if "scrollHeight" in script:
+            return self.heights.pop(0) if self.heights else 0
+        if "tweet_url" in script:  # _extract_tweets
+            return [dict(t) for t in self._current]
+        if "querySelectorAll" in script:  # _count_tweets
+            return len(self._current)
+        raise AssertionError(f"unexpected script: {script}")
+
+
+def _card(n):
+    return {
+        "tweet_url": f"https://x.com/someone/status/{n}",
+        "author": f"user{n}",
+        "text": f"texto {n}",
+        "thumbnail_url": None,
+        "has_media": 0,
+        "article_content": None,
+    }
+
+
+def test_collect_keeps_tweets_that_only_existed_mid_scroll(instant_scroll):
+    """The bug in one test: card 2 is unmounted before the scroll settles."""
+    page = FakeTimeline(rounds=[[_card(1)], [_card(2)], [_card(3)], [_card(3)]])
+
+    collected = x_sync._collect_bookmarks(page)
+
+    urls = {t["tweet_url"] for t in collected}
+    assert urls == {
+        "https://x.com/someone/status/1",
+        "https://x.com/someone/status/2",
+        "https://x.com/someone/status/3",
+    }
+
+
+def test_collect_includes_the_top_of_the_list_before_any_scroll(instant_scroll):
+    """Round 0 is where the newest bookmarks live -- exactly what went missing."""
+    page = FakeTimeline(rounds=[[_card(99)], [_card(1)], [_card(1)]])
+
+    collected = x_sync._collect_bookmarks(page)
+
+    assert "https://x.com/someone/status/99" in {t["tweet_url"] for t in collected}
+
+
+def test_collect_deduplicates_a_tweet_seen_in_several_rounds(instant_scroll):
+    page = FakeTimeline(rounds=[[_card(1)], [_card(1), _card(2)], [_card(1)], [_card(1)]])
+
+    collected = x_sync._collect_bookmarks(page)
+
+    assert len(collected) == 2
+
+
+def test_collect_reports_progress_while_it_scrolls(instant_scroll):
+    page = FakeTimeline(rounds=[[_card(1)], [_card(2)], [_card(2)]])
+    reported = []
+
+    x_sync._collect_bookmarks(page, on_progress=lambda **event: reported.append(event))
+
+    assert reported, "the scroll phase must keep reporting"
+    assert all("message" in event for event in reported)
+
+
+# ---------------------------------------------------------------------------
+# Full text from the permalink
+#
+# The timeline truncates long tweets behind "Show more"; the stored text tops
+# out around 280 characters. The permalink page carries the whole thing.
+# ---------------------------------------------------------------------------
+
+class FakePermalinkPage:
+    """`goto` + `wait_for_selector` + `evaluate`, the three calls the fetch makes."""
+
+    def __init__(self, text=None, fail_on=None):
+        self.text = text
+        self.fail_on = fail_on
+        self.visited = []
+
+    def goto(self, url, **kwargs):
+        self.visited.append(url)
+        if self.fail_on == "goto":
+            raise RuntimeError("navigation failed")
+
+    def wait_for_selector(self, selector, **kwargs):
+        if self.fail_on == "wait":
+            raise RuntimeError("tweet never rendered")
+
+    def evaluate(self, script):
+        if self.fail_on == "evaluate":
+            raise RuntimeError("page died")
+        return self.text
+
+
+def test_fetch_full_text_returns_the_whole_tweet():
+    long_text = "palabra " * 300
+    page = FakePermalinkPage(text=long_text)
+
+    assert x_sync._fetch_full_text(page, "https://x.com/u/status/1") == long_text
+
+
+def test_fetch_full_text_visits_the_permalink():
+    page = FakePermalinkPage(text="hola")
+
+    x_sync._fetch_full_text(page, "https://x.com/u/status/1")
+
+    assert page.visited == ["https://x.com/u/status/1"]
+
+
+@pytest.mark.parametrize("fail_on", ["goto", "wait", "evaluate"])
+def test_fetch_full_text_degrades_to_none_instead_of_raising(fail_on):
+    """A deleted or protected tweet must not take the whole sync down with it."""
+    page = FakePermalinkPage(fail_on=fail_on)
+
+    assert x_sync._fetch_full_text(page, "https://x.com/u/status/1") is None

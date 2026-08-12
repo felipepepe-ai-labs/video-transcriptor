@@ -407,7 +407,7 @@ def _count_tweets(page) -> int:
     return page.evaluate("document.querySelectorAll(\"[data-testid='tweet']\").length")
 
 
-def _scroll_until_stable(page, on_progress=None) -> bool:
+def _scroll_until_stable(page, on_progress=None, on_round=None) -> bool:
     """Scroll the bookmarks page until no new content appears.
 
     Strategy (from x-bookmarks-curator):
@@ -420,6 +420,11 @@ def _scroll_until_stable(page, on_progress=None) -> bool:
     round this loop can run for the better part of a minute, so without it the UI
     has nothing to show but a frozen message. Kept a plain callback rather than an
     import of the progress registry, so this module stays a pure scraping seam.
+
+    ``on_round`` is called with ``page`` at the end of every round. It exists
+    because X virtualises the timeline: cards that scroll away are unmounted, so
+    whoever wants the whole list has to read it as it goes past rather than once
+    at the end. See ``_collect_bookmarks``.
 
     Returns True if stable (new content found), False if no more content appeared.
     """
@@ -451,6 +456,10 @@ def _scroll_until_stable(page, on_progress=None) -> bool:
                 found=found,
             )
 
+        # Harvest before the next scroll unmounts what is on screen right now.
+        if on_round:
+            on_round(page)
+
         if curr_height == prev_height:
             stable_count += 1
         else:
@@ -462,6 +471,68 @@ def _scroll_until_stable(page, on_progress=None) -> bool:
             break
 
     return stable_count >= _SCROLL_STABLE_ROUNDS
+
+
+# How long to wait on a single tweet's own page. Shorter than the timeline's
+# budget on purpose: this runs once per bookmark, so a slow permalink costs the
+# whole sync, and one missing expansion is far cheaper than a stalled run.
+_PERMALINK_TIMEOUT_MS = 15_000
+
+
+def _collect_bookmarks(page, on_progress=None) -> list[dict]:
+    """Read the timeline as it scrolls past, not once at the end.
+
+    X renders the bookmarks list virtualised: only the cards near the viewport
+    stay mounted, and the rest are thrown away. Extracting a single time after
+    the scroll settles therefore returns whatever happens to be on screen at the
+    bottom -- the OLDEST bookmarks -- and silently drops everything else. On a
+    real account that was 4 of 33, with the newest ones always among the missing.
+
+    So every round is harvested into a dict keyed by permalink. First sighting
+    wins: a card is at its most complete when it is fully on screen, which is
+    when it first appears.
+    """
+    seen: dict[str, dict] = {}
+
+    def harvest(_page=None) -> None:
+        for tweet in _extract_tweets(page):
+            seen.setdefault(tweet["tweet_url"], tweet)
+
+    # Round 0, before the first scroll: the top of the list is where the most
+    # recently bookmarked tweets live, and it is gone the moment we scroll.
+    harvest()
+    _scroll_until_stable(page, on_progress=on_progress, on_round=harvest)
+
+    return list(seen.values())
+
+
+def _fetch_full_text(page, permalink: str) -> str | None:
+    """Return a tweet's untruncated text, or None if it cannot be read.
+
+    The timeline collapses long tweets behind a "Show more" button, which caps
+    the stored text at roughly 280 characters. The tweet's own page carries the
+    whole thing, so the expansion is a navigation rather than a click: no
+    locale-dependent button label, and no node that can be unmounted between
+    the click and the read.
+
+    Only the FIRST article is read -- the ones after it are replies.
+
+    Returns None on any failure, by design: a deleted, protected or simply slow
+    tweet must not take down a sync that has already collected everything else.
+    """
+    try:
+        page.goto(permalink, wait_until="domcontentloaded", timeout=_PERMALINK_TIMEOUT_MS)
+        page.wait_for_selector("[data-testid='tweet']", timeout=_PERMALINK_TIMEOUT_MS)
+        return page.evaluate("""
+            () => {
+                const article = document.querySelector("article[data-testid='tweet']");
+                const el = article?.querySelector("[data-testid='tweetText']");
+                return el?.innerText?.trim() || null;
+            }
+        """)
+    except Exception as exc:
+        logger.warning("could not expand %s: %s", permalink, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -532,15 +603,28 @@ def sync_x_bookmarks(session_path: str | Path, db, on_progress=None) -> list[dic
             if on_progress:
                 on_progress(message="Bookmarks cargados, recorriendo la lista…")
 
-            # Scroll until stable.
-            _scroll_until_stable(page, on_progress=on_progress)
-
-            # A second mini-scroll pass in case lazy-loading missed something.
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            time.sleep(_SCROLL_PAUSE)
-
-            results = _extract_tweets(page)
+            # Scroll, harvesting every round: the timeline is virtualised and
+            # will not hold the whole list at once.
+            results = _collect_bookmarks(page, on_progress=on_progress)
             logger.info("extracted %d bookmarks from the timeline", len(results))
+
+            # Second pass: the timeline truncates long tweets, so the full text
+            # has to come from each tweet's own page. Best-effort by design --
+            # whatever fails keeps the truncated version rather than nothing.
+            total = len(results)
+            expanded = 0
+            for index, tweet in enumerate(results, start=1):
+                if on_progress:
+                    on_progress(
+                        message=f"Descargando el texto completo… ({index}/{total})",
+                        done=index,
+                        total=total,
+                    )
+                full_text = _fetch_full_text(page, tweet["tweet_url"])
+                tweet["expanded_text"] = full_text
+                if full_text:
+                    expanded += 1
+            logger.info("expanded the full text of %d/%d bookmarks", expanded, total)
         except Exception as exc:
             logger.warning("scrape failed: %s", exc)
             raise ScrapingError(_explain_scrape_failure(unauthorized, exc)) from exc

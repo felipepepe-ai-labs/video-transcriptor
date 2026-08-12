@@ -315,3 +315,64 @@ def test_delete_bookmark_survives_an_already_missing_file(db, tmp_path):
 
 def test_delete_bookmark_reports_failure_for_an_unknown_id(db):
     assert xb.delete_bookmark(999999, db=db) is False
+
+
+# ---------------------------------------------------------------------------
+# Backfilling the expanded text onto rows that already exist
+#
+# The scraper only learned to fetch untruncated text later, so the rows already
+# in the DB carry the ~280-char timeline version. INSERT OR IGNORE would leave
+# them that way for ever: the backfill has to reach existing rows, without
+# touching any of the curatorial state around them.
+# ---------------------------------------------------------------------------
+
+def test_sync_bookmarks_backfills_expanded_text_on_a_known_url(db):
+    url = "https://x.com/a/status/1"
+    xb.sync_bookmarks(db, [{"tweet_url": url, "text": "truncado…"}])
+
+    xb.sync_bookmarks(db, [{"tweet_url": url, "expanded_text": "el texto completo"}])
+
+    row = db.execute("SELECT expanded_text FROM bookmarks").fetchone()
+    assert row["expanded_text"] == "el texto completo"
+
+
+def test_backfill_keeps_the_curatorial_state_intact(db):
+    """Re-syncing must not undo a review, a download or a transcription job."""
+    url = "https://x.com/a/status/1"
+    xb.sync_bookmarks(db, [{"tweet_url": url}])
+    db.execute(
+        "UPDATE bookmarks SET status = 'interesting', local_file_path = '/v/1.mp4', "
+        "job_id = 'job-abc'"
+    )
+    db.commit()
+
+    xb.sync_bookmarks(db, [{"tweet_url": url, "expanded_text": "el texto completo"}])
+
+    row = db.execute(
+        "SELECT status, local_file_path, job_id, expanded_text FROM bookmarks"
+    ).fetchone()
+    assert row["status"] == "interesting"
+    assert row["local_file_path"] == "/v/1.mp4"
+    assert row["job_id"] == "job-abc"
+    assert row["expanded_text"] == "el texto completo"
+
+
+def test_backfill_does_not_erase_text_it_could_not_fetch(db):
+    """A failed permalink yields None; that must not wipe what we already had."""
+    url = "https://x.com/a/status/1"
+    xb.sync_bookmarks(db, [{"tweet_url": url, "expanded_text": "el texto completo"}])
+
+    xb.sync_bookmarks(db, [{"tweet_url": url, "expanded_text": None}])
+
+    row = db.execute("SELECT expanded_text FROM bookmarks").fetchone()
+    assert row["expanded_text"] == "el texto completo"
+
+
+def test_backfill_is_not_counted_as_an_insertion(db):
+    url = "https://x.com/a/status/1"
+    xb.sync_bookmarks(db, [{"tweet_url": url}])
+
+    inserted = xb.sync_bookmarks(db, [{"tweet_url": url, "expanded_text": "completo"}])
+
+    assert inserted == 0
+    assert db.execute("SELECT count(*) FROM bookmarks").fetchone()[0] == 1
