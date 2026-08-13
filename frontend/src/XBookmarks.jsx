@@ -34,6 +34,21 @@ function statusClass(status) {
   return "new"
 }
 
+// POST /x/bookmarks/{id}/download only accepts 'interesting' and 'no_media':
+// marking a bookmark is the curation filter, and 'no_media' is there so a tweet
+// yt-dlp found no video in can be retried. Offering the button for every status
+// meant most cards answered 409 -- so the button now says why instead.
+function downloadAction(bm, busy) {
+  if (busy) return { icon: "⏳", disabled: true, title: "Descargando…" }
+  if (bm.status === "interesting" || bm.status === "no_media") {
+    return { icon: "⬇️", disabled: false, title: "Descargar video" }
+  }
+  if (bm.status === "downloaded") {
+    return { icon: "✅", disabled: true, title: "Ya descargado" }
+  }
+  return { icon: "⬇️", disabled: true, title: "Márcalo como interesante (☆) para descargarlo" }
+}
+
 function formatDate(scrapedAt) {
   if (!scrapedAt) return ""
   // scraped_at is an ISO-8601 string from the backend, not a unix timestamp.
@@ -483,14 +498,19 @@ function XBookmarks({ onOpenJob }) {
                   >
                     {bm.status === "interesting" ? "⭐" : "☆"}
                   </button>
-                  <button
-                    title="Descargar video"
-                    disabled={downloadingIds.has(bm.id)}
-                    onClick={() => downloadBookmark(bm.id)}
-                    aria-label="Descargar"
-                  >
-                    {downloadingIds.has(bm.id) ? "⏳" : "⬇️"}
-                  </button>
+                  {(() => {
+                    const dl = downloadAction(bm, downloadingIds.has(bm.id))
+                    return (
+                      <button
+                        title={dl.title}
+                        disabled={dl.disabled}
+                        onClick={() => downloadBookmark(bm.id)}
+                        aria-label="Descargar"
+                      >
+                        {dl.icon}
+                      </button>
+                    )
+                  })()}
                   {bm.status === "downloaded" && !bm.job_id && (
                     <button
                       title="Transcribir y traducir (el mismo proceso que YouTube)"
