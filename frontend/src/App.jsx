@@ -646,7 +646,7 @@ function App() {
         </section>
       )}
 
-      {loading && uploadProgress === null && (
+      {loading && uploadProgress === null && inputMode !== "x" && (
         <div className="status-message">
           <span className="spinner"></span>
           {STAGE_LABELS[job?.stage] ?? "Enviando video a Whisper..."}
