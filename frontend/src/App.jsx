@@ -25,6 +25,10 @@ function App() {
   const [allJobs, setAllJobs] = useState([])
   const [videosLoading, setVideosLoading] = useState(false)
   const [videosError, setVideosError] = useState("")
+  // Set when the user explicitly asks to see a job (the 📄 button on an X
+  // bookmark, a history card). The X panel hides the viewer otherwise, so a
+  // result left over from another tab does not land under the bookmark list.
+  const [viewerRequested, setViewerRequested] = useState(false)
   const [showChapters, setShowChapters] = useState(false)
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
@@ -49,6 +53,12 @@ function App() {
     setChapterAudioReady({})
     setChapterAudioLoading(null)
   }, [job?.id])
+
+  // Leaving a tab ends the explicit request: coming back to X should show the
+  // bookmark list on its own, not whatever was last opened from it.
+  useEffect(() => {
+    setViewerRequested(false)
+  }, [inputMode])
 
   useEffect(() => {
     // Covers the "failed" path too, not just success -- otherwise a failed
@@ -124,6 +134,7 @@ function App() {
     setError("")
     setResult(null)
     setJob(null)
+    setViewerRequested(true)
     try {
       const res = await fetch(`${API_URL}/jobs/${jobId}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -537,9 +548,10 @@ function App() {
       {inputMode === "x" && (
         <XBookmarks
           onOpenJob={(jobId) => {
-            // Same pipeline, same results screen -- and it already renders
-            // under whichever tab is open, so stay on X rather than dumping
-            // the user on the upload tab and losing their place in the list.
+            // Same pipeline, same results screen. openJob marks the viewer as
+            // explicitly requested, which is what lets it render here at all --
+            // so the user keeps their place in the list instead of being sent
+            // to the upload tab to read a transcript.
             openJob(jobId)
             requestAnimationFrame(() =>
               document.querySelector(".results, .status-message")
@@ -551,8 +563,10 @@ function App() {
       {inputMode === "settings" && <Settings />}
 
 
-      {/* Results — only when not in the X panel (multiple concurrent jobs) */}
-      {result && inputMode !== "x" && (
+      {/* Results. In the X panel several jobs run at once, so the viewer only
+          appears for a job the user actually asked to see -- otherwise the
+          per-card progress stays the single source of truth there. */}
+      {result && (inputMode !== "x" || viewerRequested) && (
         <section className="results">
           <div className="meta-bar">
             <span>📄 {result.filename}</span>
