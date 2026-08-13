@@ -10,13 +10,6 @@ import { STAGE_LABELS } from "./stages.js"
 const API_URL = ""  // relative so it always goes through Vite's proxy, regardless of LAN address
 const POLL_INTERVAL_MS = 2000
 
-const STATUS_ICONS = {
-  queued: "⏳",
-  running: "⏳",
-  done: "✅",
-  failed: "❌",
-}
-
 function App() {
   const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "x"
   const [youtubeUrl, setYoutubeUrl] = useState("")
@@ -30,17 +23,14 @@ function App() {
   const [showChapters, setShowChapters] = useState(false)
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
-  const [history, setHistory] = useState([])
   const [uploadProgress, setUploadProgress] = useState(null) // 0-100 while sending, null otherwise
   const [regenVoice, setRegenVoice] = useState("male")
   const [chapterAudioReady, setChapterAudioReady] = useState({}) // { [chapterIndex]: true }
   const [chapterAudioLoading, setChapterAudioLoading] = useState(null) // chapterIndex currently generating, or null
   const [playingChapterVideo, setPlayingChapterVideo] = useState(null) // chapterIndex playing inline video, or null
-  const [summaryLoading, setSummaryLoading] = useState(null) // jobId currently generating summary, or null
   const pollRef = useRef(null)
 
   useEffect(() => {
-    refreshHistory()
     return () => stopPolling()
   }, [])
 
@@ -60,33 +50,6 @@ function App() {
     // chapter-audio generation left the button stuck showing its spinner.
     if (job && job.status !== "running") setChapterAudioLoading(null)
   }, [job])
-
-  async function refreshHistory() {
-    try {
-      const res = await fetch(`${API_URL}/jobs`)
-      if (!res.ok) return
-      setHistory(await res.json())
-    } catch {
-      // history is a convenience panel; ignore failures silently
-    }
-  }
-
-  async function deleteJob(jobId, e) {
-    e.stopPropagation()
-    if (!window.confirm("¿Eliminar este trabajo del historial?")) return
-    try {
-      const res = await fetch(`${API_URL}/jobs/${jobId}`, { method: "DELETE" })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      if (job?.id === jobId) {
-        setJob(null)
-        setResult(null)
-        stopPolling()
-      }
-      refreshHistory()
-    } catch (e) {
-      setError(e.message)
-    }
-  }
 
   async function openJob(jobId) {
     stopPolling()
@@ -132,13 +95,11 @@ function App() {
           setResult(data.result)
           setLoading(false)
           stopPolling()
-          refreshHistory()
           onDone?.()
         } else if (data.status === "failed") {
           setError(data.error ?? "La transcripción falló")
           setLoading(false)
           stopPolling()
-          refreshHistory()
         } else {
           pollJob(jobId, onDone)
         }
@@ -174,7 +135,6 @@ function App() {
         if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
         setJob({ status: "queued", stage: "downloading" })
         pollJob(body.job_id)
-        refreshHistory()
       } catch (e) {
         setError(e.message)
         setLoading(false)
@@ -189,7 +149,6 @@ function App() {
       setUploadProgress(null)
       setJob({ status: "queued", stage: "uploading" })
       pollJob(job_id)
-      refreshHistory()
     } catch (e) {
       setUploadProgress(null)
       setError(e.message)
@@ -251,40 +210,6 @@ function App() {
       setLoading(false)
       setChapterAudioLoading(null)
     }
-  }
-
-  async function generateSummary(jobId, btnEl) {
-    setSummaryLoading(jobId)
-    setError("")
-    try {
-      const res = await fetch(`${API_URL}/jobs/${jobId}/summarize`, { method: "POST" })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-
-      // Poll until summary appears on this job.
-      const poll = setInterval(async () => {
-        const jRes = await fetch(`${API_URL}/jobs/${jobId}`)
-        const jData = await jRes.json()
-        if (jData.result?.summary_es) {
-          clearInterval(poll)
-          setSummaryLoading(null)
-          openJob(jobId)
-          refreshHistory()
-        }
-      }, 2000)
-
-      // Timeout after 5 minutes.
-      setTimeout(() => { clearInterval(poll); setSummaryLoading(null) }, 300_000)
-    } catch (e) {
-      setError(e.message)
-      setSummaryLoading(null)
-    }
-  }
-
-  function formatDate(unixSeconds) {
-    if (!unixSeconds) return ""
-    return new Date(unixSeconds * 1000).toLocaleString("es-ES", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
-    })
   }
 
   function formatDuration(sec) {
@@ -463,52 +388,9 @@ function App() {
       )}
       {inputMode === "settings" && <Settings />}
 
-      {/* History */}
-      {history.length > 0 && (
-        <section className="history-section">
-          <h2 className="history-heading">Historial</h2>
-          <ul className="history-list">
-            {history.map((h) => (
-              <li key={h.id}>
-                <button
-                  className={`history-item ${job && h.id === job.id ? "active" : ""}`}
-                  onClick={() => openJob(h.id)}
-                >
-                  <span className={`history-status status-${h.status}`}>
-                    {STATUS_ICONS[h.status] ?? "•"}
-                  </span>
-                  <span className="history-source" title={h.source === "youtube" ? "Video de YouTube" : "Archivo subido"}>
-                    {h.source === "youtube" ? "▶️" : "📁"}
-                  </span>
-                  <span className="history-filename">{h.title || h.filename}</span>
-                  <span className="history-date">{formatDate(h.created_at)}</span>
-                </button>
-                {h.status === "done" && !h.summary_es && (
-                  <button
-                    className="history-generate-summary"
-                    onClick={(e) => { e.stopPropagation(); generateSummary(h.id, e); }}
-                    title="Generar resumen"
-                    disabled={summaryLoading === h.id}
-                  >
-                    {summaryLoading === h.id ? "⏳" : "📝"}
-                  </button>
-                )}
-                <button
-                  className="history-delete"
-                  onClick={(e) => deleteJob(h.id, e)}
-                  aria-label="Eliminar trabajo"
-                  title="Eliminar"
-                >
-                  🗑️
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
 
-      {/* Results */}
-      {result && (
+      {/* Results — only when not in the X panel (multiple concurrent jobs) */}
+      {result && inputMode !== "x" && (
         <section className="results">
           <div className="meta-bar">
             <span>📄 {result.filename}</span>

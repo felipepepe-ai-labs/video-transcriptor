@@ -23,9 +23,6 @@ const STATUS_LABELS = {
   no_media: "sin video",
 }
 
-// Statuses the backend accepts a download for; no_media is retryable.
-const DOWNLOADABLE = ["interesting", "no_media"]
-
 // Roughly what fits in the four clamped lines of .bookmark-text. Below this the
 // toggle would expand to exactly what is already on screen.
 const TEXT_CLAMP_CHARS = 180
@@ -486,16 +483,14 @@ function XBookmarks({ onOpenJob }) {
                   >
                     {bm.status === "interesting" ? "⭐" : "☆"}
                   </button>
-                  {DOWNLOADABLE.includes(bm.status) && (
-                    <button
-                      title={bm.status === "no_media" ? "Reintentar descarga" : "Descargar video"}
-                      disabled={downloadingIds.has(bm.id)}
-                      onClick={() => downloadBookmark(bm.id)}
-                      aria-label={bm.status === "no_media" ? "Reintentar descarga" : "Descargar"}
-                    >
-                      {downloadingIds.has(bm.id) ? "⏳" : bm.status === "no_media" ? "🔁" : "⬇️"}
-                    </button>
-                  )}
+                  <button
+                    title="Descargar video"
+                    disabled={downloadingIds.has(bm.id)}
+                    onClick={() => downloadBookmark(bm.id)}
+                    aria-label="Descargar"
+                  >
+                    {downloadingIds.has(bm.id) ? "⏳" : "⬇️"}
+                  </button>
                   {bm.status === "downloaded" && !bm.job_id && (
                     <button
                       title="Transcribir y traducir (el mismo proceso que YouTube)"
