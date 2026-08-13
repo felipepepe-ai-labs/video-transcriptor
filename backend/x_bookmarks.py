@@ -6,8 +6,10 @@ local database so bookmarks survive backend restarts, independently of the
 transcription jobs system (`jobs.py`).
 """
 
+import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -101,7 +103,8 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     transcript_original TEXT,
     transcript_language TEXT,
     transcribed_at TEXT,
-    job_id TEXT
+    job_id TEXT,
+    chapters_json TEXT
 )
 """
 
@@ -116,7 +119,38 @@ _MIGRATIONS = {
     "transcribed_at": "TEXT",
     # The transcription job in jobs.db, so a card can link back to its results.
     "job_id": "TEXT",
+    "chapters_json": "TEXT",
 }
+
+
+# Regex patterns that match timestamps in tweet text.
+# Supports formats: "0:00 Intro", "1:31 Main topic", "2:03 The agent finds"
+_TIMESTAMP_RE = re.compile(
+    r'^(?P<time>\d+:\d+(?::\d+)?)\s+(?P<title>.+)$',
+    re.MULTILINE,
+)
+
+
+def _seconds_from_timestamp(ts: str) -> int:
+    """Parse '1:31' or '2:03:45' into total seconds."""
+    parts = ts.split(':')
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+
+def _parse_chapters(text: str) -> str | None:
+    """Extract chapters from tweet text and return as JSON string, or None."""
+    chapters = []
+    for m in _TIMESTAMP_RE.finditer(text):
+        chapters.append({"time": _seconds_from_timestamp(m.group("time")), "title": m.group("title").strip()})
+    if not chapters:
+        # Fallback: match any "HH:MM" or "H:MM" pattern followed by title
+        for m in re.finditer(r'(\d+:\d+(?::\d+)?)\s+(.+?)(?=\n\n|$)', text):
+            chapters.append({"time": _seconds_from_timestamp(m.group(1)), "title": m.group(2).strip()})
+    if not chapters:
+        return None
+    return json.dumps(chapters)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -175,6 +209,10 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
             "article_content": b.get("article_content"),
             "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        # Auto-parse chapters from tweet text (e.g. "0:00 Intro\n1:31 Main topic")
+        expanded = b.get("expanded_text")
+        if expanded:
+            row["chapters_json"] = _parse_chapters(expanded)
         if not row["tweet_url"]:
             continue
         cols = ", ".join(row.keys())
@@ -190,7 +228,8 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
         # user's curation, and a re-sync has no business undoing it.
         conn.execute(
             f"INSERT INTO bookmarks ({cols}) VALUES ({placeholders}) "
-            "ON CONFLICT(tweet_url) DO UPDATE SET expanded_text = excluded.expanded_text "
+            "ON CONFLICT(tweet_url) DO UPDATE SET expanded_text = excluded.expanded_text, "
+            "chapters_json = excluded.chapters_json "
             "WHERE excluded.expanded_text IS NOT NULL",
             list(row.values()),
         )
@@ -215,7 +254,7 @@ def list_bookmarks(db: sqlite3.Connection | None = None, status_filter: str | No
     base = (
         "SELECT id, tweet_url, author, text, expanded_text, thumbnail_url, status, "
         "local_file_path, scraped_at, downloaded_at, job_id, has_media, "
-        "transcription_status FROM bookmarks"
+        "transcription_status, chapters_json FROM bookmarks"
     )
     where = ""
     params: tuple = ()

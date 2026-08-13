@@ -6,8 +6,15 @@ export default defineConfig({
   server: {
     host: '0.0.0.0',
     proxy: {
-      '/transcribe': 'http://localhost:8000',
+      '/config': 'http://localhost:8000',
       '/health': 'http://localhost:8000',
+      '/transcribe': 'http://localhost:8000',
+      // catch-all for everything else the frontend requests
+      '/jobs': 'http://localhost:8000',
+      '/upload': 'http://localhost:8000',
+      '/x': 'http://localhost:8000',
+      '/audio': 'http://localhost:8000',
+      '/video': 'http://localhost:8000',
     },
   },
 })

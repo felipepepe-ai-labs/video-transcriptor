@@ -4,7 +4,8 @@ import ChaptersEditor from "./ChaptersEditor.jsx"
 import { cleanChapters } from "./chapters.js"
 import { STAGE_LABELS } from "./stages.js"
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+// Relative so it always goes through Vite's proxy, regardless of LAN address.
+const API_URL = ""
 const JOB_POLL_INTERVAL_MS = 2000
 
 const STATUS_FILTERS = [
@@ -403,6 +404,10 @@ function XBookmarks({ onOpenJob }) {
             // the timeline's ~280 chars when it could not be reached.
             const text = bm.expanded_text ?? bm.text ?? ""
             const isExpanded = expandedIds.has(bm.id)
+            // Parse auto-chapters from backend JSON (if present on this bookmark).
+            const parsedChapters = bm.chapters_json ? (() => {
+              try { return JSON.parse(bm.chapters_json) } catch { return [] }
+            })() : null
             return (
             <div key={bm.id} className="bookmark-card">
               {bm.thumbnail_url && (

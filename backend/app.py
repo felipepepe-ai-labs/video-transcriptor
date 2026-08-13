@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()  # read backend/.env into os.environ before anything reads it
+
 from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -43,7 +47,14 @@ from translate import translate_with_fallback
 import summarize
 
 # ── Config ────────────────────────────────────────────────────────────
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+_FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+if _frontend_origin := os.getenv("FRONTEND_ALLOW_ORIGINS"):
+    _FRONTEND_ALLOW_ORIGINS = [o for o in _frontend_origin.split(",") if o]
+else:
+    _FRONTEND_ALLOW_ORIGINS = [_FRONTEND_ORIGIN]
+
+# Keep FRONTEND_ORIGIN for backward compatibility with code that reads it.
+FRONTEND_ORIGIN = _FRONTEND_ORIGIN
 
 # Configured first so everything below can log. Module loggers propagate to the
 # root logger, which drops anything below WARNING when nothing configured it —
@@ -84,7 +95,7 @@ app = FastAPI(title="Video Transcriptor EN → ES", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=_FRONTEND_ALLOW_ORIGINS,
     # PATCH and DELETE are used by the bookmarks UI and PUT by the settings
     # panel; without them here the browser's preflight answers 400 and the
     # buttons fail with an opaque network error.

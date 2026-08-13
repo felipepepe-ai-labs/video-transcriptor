@@ -7,7 +7,7 @@ import ChaptersEditor from "./ChaptersEditor.jsx"
 import { cleanChapters } from "./chapters.js"
 import { STAGE_LABELS } from "./stages.js"
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+const API_URL = ""  // relative so it always goes through Vite's proxy, regardless of LAN address
 const POLL_INTERVAL_MS = 2000
 
 const STATUS_ICONS = {
