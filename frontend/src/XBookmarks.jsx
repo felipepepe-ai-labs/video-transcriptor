@@ -152,9 +152,9 @@ function XBookmarks({ onOpenJob }) {
     return () => source.close()
   }, [])
 
-  // Which jobs are worth asking about: a bookmark that is mid-transcription.
+  // Which jobs are worth asking about: any bookmark that has a job assigned.
   const watchedKey = bookmarks
-    .filter((bm) => bm.job_id && transcribingIds.has(bm.id))
+    .filter((bm) => bm.job_id)
     .map((bm) => bm.job_id)
     .join(",")
 
