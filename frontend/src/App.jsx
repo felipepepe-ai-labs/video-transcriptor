@@ -11,7 +11,7 @@ const API_URL = ""  // relative so it always goes through Vite's proxy, regardle
 const POLL_INTERVAL_MS = 2000
 
 function App() {
-  const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "x"
+  const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "videos" | "x" | "settings"
   const [youtubeUrl, setYoutubeUrl] = useState("")
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -20,6 +20,10 @@ function App() {
   const [error, setError] = useState("")
   const [dragOver, setDragOver] = useState(false)
   const [tab, setTab] = useState("es") // "en" | "es"
+  // Videos procesados: list from GET /jobs + expanded detail per job.
+  const [allJobs, setAllJobs] = useState([])
+  const [expandedJobId, setExpandedJobId] = useState(null)
+  const [jobDetail, setJobDetail] = useState(null) // result blob of the expanded card
   const [showChapters, setShowChapters] = useState(false)
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
@@ -50,6 +54,53 @@ function App() {
     // chapter-audio generation left the button stuck showing its spinner.
     if (job && job.status !== "running") setChapterAudioLoading(null)
   }, [job])
+
+  // Load the jobs list on entering the videos tab.
+  useEffect(() => {
+    if (inputMode !== "videos") return
+    let cancelled = false
+    fetchJobs().then((rows) => {
+      if (!cancelled && rows) setAllJobs(rows)
+    })
+    return () => { cancelled = true }
+  }, [inputMode])
+
+  // Keep badges/stages live while something is still running. The dependency
+  // is the boolean, not allJobs itself: depending on the array would re-run
+  // this on every refresh (a new array identity each time) and re-fetch in a
+  // loop, while the boolean only flips when the last running job finishes --
+  // which is exactly when the interval should stop.
+  const hasRunningJob = allJobs.some((j) => j.status === "running")
+  useEffect(() => {
+    if (inputMode !== "videos" || !hasRunningJob) return
+    let cancelled = false
+    const timer = setInterval(async () => {
+      const rows = await fetchJobs()
+      if (!cancelled && rows) setAllJobs(rows)
+    }, POLL_INTERVAL_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [inputMode, hasRunningJob])
+
+  // The listing omits result_json by design, so the expanded card fetches the
+  // full result on demand. The cancelled flag drops a slow response for a card
+  // the user already closed or swapped -- expanding two cards in quick
+  // succession would otherwise land the first job's detail under the second's.
+  useEffect(() => {
+    if (!expandedJobId) {
+      setJobDetail(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(`${API_URL}/jobs/${expandedJobId}`)
+        if (!res.ok) return
+        const body = await res.json()
+        if (!cancelled) setJobDetail(body.result ?? null)
+      } catch {}
+    })()
+    return () => { cancelled = true }
+  }, [expandedJobId])
 
   async function openJob(jobId) {
     stopPolling()
@@ -270,6 +321,15 @@ function App() {
           >
             ⚙️ Ajustes
           </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "videos"}
+            className={inputMode === "videos" ? "active" : ""}
+            onClick={() => setInputMode("videos")}
+          >
+            🎞️ Videos procesados
+          </button>
         </div>
 
         {inputMode === "youtube" && (
@@ -370,6 +430,157 @@ function App() {
 
         {error && <div className="error-banner">❌ {error}</div>}
       </section>
+
+      {/* Videos procesados panel */}
+      {inputMode === "videos" && (
+        <section className="videos-list">
+          <h2 style={{ margin: 0 }}>Videos procesados</h2>
+          {allJobs.length === 0 ? (
+            <p className="x-empty">No hay videos procesados todav&#237;a.</p>
+          ) : (
+            <div className="videos-grid">
+              {allJobs.map((j) => {
+                const isExpanded = expandedJobId === j.id
+                // Fetched by the effect above; null until it lands, so the
+                // detail panel renders progressively rather than blocking.
+                const jobResult = isExpanded ? jobDetail : null
+                return (
+                  <div key={j.id} className="video-card">
+                    {/* Header: status + source + timestamp */}
+                    <div className="video-card-head">
+                      <StatusBadge status={j.status} stage={j.stage} />
+                      {j.source && <span className="video-card-source">{sourceLabel(j.source)}</span>}
+                      <span className="video-card-date">{formatDate(j.created_at)}</span>
+                    </div>
+
+                    {/* Clickable body */}
+                    <div
+                      className={`video-card-body${isExpanded ? " expanded" : ""}`}
+                      onClick={() => setExpandedJobId(isExpanded ? null : j.id)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault()
+                          setExpandedJobId(isExpanded ? null : j.id)
+                        }
+                      }}
+                    >
+                      {/* YouTube jobs carry the video title; uploads only have
+                          the filename. Both come from the listing, so the card
+                          reads right before any detail is fetched. */}
+                      <div className="video-card-title">
+                        {truncate(j.title || j.filename, 60) || "—"}
+                      </div>
+
+                      {/* Metadata row */}
+                      <div className="video-card-meta">
+                        {j.source === "youtube" && j.url && (
+                          <a href={j.url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
+                            ▶️ YouTube ↗
+                          </a>
+                        )}
+                        {resultDuration(j) && <span>⏱ {resultDuration(j)}</span>}
+                        {segmentsCount(j) && <span>{segmentsCount(j)} segmentos</span>}
+                        {chapterCount(j) > 0 && <span>{chapterCount(j)} cap&#237;tulos</span>}
+                      </div>
+
+                      {/* Quick icons */}
+                      <div className="video-card-icons">
+                        {hasAudio(j) && <span title="Con locuci&#243;n">🔊</span>}
+                        {hasDubbed(j) && <span title="Video doblado">🎬</span>}
+                        {hasSummary(j) && <span title="Resumen disponible">📝</span>}
+                      </div>
+
+                      {/* Summary preview -- from the listing's own column, so a
+                          collapsed card can show it without being opened. */}
+                      {!isExpanded && j.summary_es && (
+                        <p className="video-card-summary">{truncate(j.summary_es, 120)}</p>
+                      )}
+                    </div>
+
+                    {/* Expanded detail */}
+                    {jobResult && (
+                      <div className="video-card-detail">
+                        {/* Full summary */}
+                        {jobResult.summary_es && (
+                          <details open>
+                            <summary>Resumen</summary>
+                            <p className="detail-text">{jobResult.summary_es}</p>
+                          </details>
+                        )}
+
+                        {jobResult.source_language === "es" && (
+                          <p className="detail-text">🌐 ES directo (sin traducir)</p>
+                        )}
+
+                        {/* Audio + dubbed video. Narration and dubbing are
+                            best-effort, so a finished job may legitimately have
+                            neither -- the flags come from the result itself. */}
+                        <div className="detail-media">
+                          {jobResult.audio_available && (
+                            <div className="detail-audio">
+                              <audio controls src={`${API_URL}/jobs/${j.id}/audio`} />
+                              <a href={`${API_URL}/jobs/${j.id}/audio`} download>
+                                ⬇️ Audio
+                              </a>
+                            </div>
+                          )}
+                          {jobResult.dubbed_video_available && (
+                            <div className="detail-video">
+                              <video controls src={`${API_URL}/jobs/${j.id}/video`} />
+                              <a href={`${API_URL}/jobs/${j.id}/video`} download>
+                                ⬇️ Video doblado
+                              </a>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Chapters */}
+                        {jobResult.chapters?.length > 0 && (
+                          <details open>
+                            <summary>Cap&#237;tulos</summary>
+                            <ul className="detail-chapters">
+                              {jobResult.chapters.map((ch, i) => (
+                                <li key={i}>
+                                  {ch.timestamp} — {ch.title}
+                                  {jobResult.chapter_clips_available && (
+                                    <>
+                                      {" "}
+                                      <a href={`${API_URL}/jobs/${j.id}/chapters/${i}/video`} download>
+                                        ⬇️ Cap. clip
+                                      </a>
+                                    </>
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
+                        )}
+
+                        {/* Transcript toggle */}
+                        {jobResult.segments?.length > 0 && (
+                          <details>
+                            <summary>Transcript ({jobResult.segments.length} segmentos)</summary>
+                            <div className="detail-segments">
+                              {jobResult.segments.map((seg, i) => (
+                                <div key={i} className="segment-row">
+                                  <span className="ts">{formatTs(seg.start)}</span>
+                                  <span className="text tab-es">{seg.text_es}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      )}
 
       {/* X Bookmarks panel */}
       {inputMode === "x" && (
@@ -783,3 +994,91 @@ function downloadSrt(segments, lang, filename) {
 }
 
 export default App
+
+/* ── Videos procesados helpers ───────────────────────────────────── */
+
+// The listing carries everything the collapsed card needs; only the expanded
+// detail hits GET /jobs/{id}, from the effect in App().
+async function fetchJobs() {
+  try {
+    const res = await fetch(`${API_URL}/jobs`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+function sourceLabel(src) {
+  if (src === "youtube") return "▶️ YouTube"
+  return "📁 Archivo"
+}
+
+// duration_seconds is a number of seconds, unlike a segment's "HH:MM:SS.mmm"
+// start -- so this does not go through formatTs, which parses that format.
+function resultDuration(j) {
+  const total = j.duration_seconds
+  if (!total) return null
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = Math.floor(total % 60)
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m ${s}s`
+}
+
+// Map backend stage to a human label. Uses the same STAGE_LABELS as the live UI.
+function stageLabel(stage) {
+  return STAGE_LABELS[stage] ?? stage
+}
+
+function segmentsCount(j) {
+  const r = j.segments_done
+  const t = j.segments_total
+  if (r == null || t == null || t === 0) return null
+  return `${r}/${t}`
+}
+
+function chapterCount(j) {
+  return j.chapter_count ?? 0
+}
+
+function hasAudio(j) {
+  return Boolean(j.audio_available)
+}
+
+function hasDubbed(j) {
+  return Boolean(j.dubbed_video_available)
+}
+
+function hasSummary(j) {
+  return Boolean(j.summary_es)
+}
+
+// Titles scraped from X arrive as multi-line tweet text ("Marco\n@handle\n·\n6
+// ago. — ..."), so a raw slice would drop line breaks into the card. Collapse
+// whitespace first, then cut.
+function truncate(str, max) {
+  if (!str) return ""
+  const flat = str.replace(/\s+/g, " ").trim()
+  return flat.length > max ? flat.slice(0, max) + "…" : flat
+}
+
+// Status badge component used inline in the grid. 'queued' means accepted but
+// not yet picked up -- it belongs with running, not with failed.
+function StatusBadge({ status, stage }) {
+  if (status === "done") return <span className="status-badge badge-done">Listo</span>
+  if (status === "failed") return <span className="status-badge badge-failed">Fall&oacute;</span>
+  return <span className="status-badge badge-running">{stageLabel(stage) ?? "En cola"}</span>
+}
+
+// created_at/updated_at are REAL columns holding a Unix timestamp in seconds
+// (jobs.py), not an ISO string -- Date wants milliseconds.
+function formatDate(seconds) {
+  if (!seconds) return ""
+  const d = new Date(seconds * 1000)
+  if (Number.isNaN(d.getTime())) return ""
+  return d.toLocaleString("es-AR", {
+    day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+    hour12: false,
+  })
+}
