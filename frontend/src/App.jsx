@@ -20,10 +20,11 @@ function App() {
   const [error, setError] = useState("")
   const [dragOver, setDragOver] = useState(false)
   const [tab, setTab] = useState("es") // "en" | "es"
-  // Videos procesados: list from GET /jobs + expanded detail per job.
+  // Videos procesados: history list from GET /jobs. Opening a card loads it
+  // into the main results viewer below, so there is no second detail view.
   const [allJobs, setAllJobs] = useState([])
-  const [expandedJobId, setExpandedJobId] = useState(null)
-  const [jobDetail, setJobDetail] = useState(null) // result blob of the expanded card
+  const [videosLoading, setVideosLoading] = useState(false)
+  const [videosError, setVideosError] = useState("")
   const [showChapters, setShowChapters] = useState(false)
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
@@ -55,13 +56,21 @@ function App() {
     if (job && job.status !== "running") setChapterAudioLoading(null)
   }, [job])
 
-  // Load the jobs list on entering the videos tab.
+  // Load the jobs list on entering the videos tab. A failed request has to be
+  // told apart from an empty history: silently keeping the empty array would
+  // render "no hay videos" while the backend is simply unreachable.
   useEffect(() => {
     if (inputMode !== "videos") return
     let cancelled = false
-    fetchJobs().then((rows) => {
-      if (!cancelled && rows) setAllJobs(rows)
-    })
+    setVideosLoading(true)
+    setVideosError("")
+    fetchJobs()
+      .then((rows) => {
+        if (cancelled) return
+        if (rows) setAllJobs(rows)
+        else setVideosError("No se pudo cargar el historial de videos.")
+      })
+      .finally(() => { if (!cancelled) setVideosLoading(false) })
     return () => { cancelled = true }
   }, [inputMode])
 
@@ -81,26 +90,34 @@ function App() {
     return () => { cancelled = true; clearInterval(timer) }
   }, [inputMode, hasRunningJob])
 
-  // The listing omits result_json by design, so the expanded card fetches the
-  // full result on demand. The cancelled flag drops a slow response for a card
-  // the user already closed or swapped -- expanding two cards in quick
-  // succession would otherwise land the first job's detail under the second's.
-  useEffect(() => {
-    if (!expandedJobId) {
-      setJobDetail(null)
-      return
+  // Opening a card reuses the one results viewer the app already has (the same
+  // route XBookmarks takes), rather than rendering a second, poorer one inside
+  // the card. It stays mounted under this tab, so the user keeps their place.
+  function openJobFromHistory(jobId) {
+    openJob(jobId)
+    requestAnimationFrame(() =>
+      document.querySelector(".results, .status-message")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" })
+    )
+  }
+
+  async function deleteJobFromHistory(j) {
+    const label = truncate(j.title || j.filename, 60) || j.id
+    if (!window.confirm(`¿Borrar "${label}"?\n\nSe eliminan también su audio y video.`)) return
+    setVideosError("")
+    try {
+      const res = await fetch(`${API_URL}/jobs/${j.id}`, { method: "DELETE" })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      setAllJobs((rows) => rows.filter((r) => r.id !== j.id))
+      // Clear the viewer too if it was showing the job just deleted.
+      if (job?.id === j.id) {
+        setJob(null)
+        setResult(null)
+      }
+    } catch (e) {
+      setVideosError(`No se pudo borrar: ${e.message}`)
     }
-    let cancelled = false
-    ;(async () => {
-      try {
-        const res = await fetch(`${API_URL}/jobs/${expandedJobId}`)
-        if (!res.ok) return
-        const body = await res.json()
-        if (!cancelled) setJobDetail(body.result ?? null)
-      } catch {}
-    })()
-    return () => { cancelled = true }
-  }, [expandedJobId])
+  }
 
   async function openJob(jobId) {
     stopPolling()
@@ -315,20 +332,22 @@ function App() {
           <button
             type="button"
             role="tab"
-            aria-selected={inputMode === "settings"}
-            className={inputMode === "settings" ? "active" : ""}
-            onClick={() => setInputMode("settings")}
-          >
-            ⚙️ Ajustes
-          </button>
-          <button
-            type="button"
-            role="tab"
             aria-selected={inputMode === "videos"}
             className={inputMode === "videos" ? "active" : ""}
             onClick={() => setInputMode("videos")}
           >
             🎞️ Videos procesados
+          </button>
+          {/* Settings is not an input source like the tabs before it, so it
+              sits apart, pushed to the far end of the row. */}
+          <button
+            type="button"
+            role="tab"
+            aria-selected={inputMode === "settings"}
+            className={`tab-settings${inputMode === "settings" ? " active" : ""}`}
+            onClick={() => setInputMode("settings")}
+          >
+            ⚙️ Ajustes
           </button>
         </div>
 
@@ -434,147 +453,79 @@ function App() {
       {/* Videos procesados panel */}
       {inputMode === "videos" && (
         <section className="videos-list">
-          <h2 style={{ margin: 0 }}>Videos procesados</h2>
-          {allJobs.length === 0 ? (
+          <h2>Videos procesados</h2>
+
+          {videosError && <div className="error-banner">❌ {videosError}</div>}
+
+          {videosLoading && allJobs.length === 0 ? (
+            <p className="x-empty">Cargando…</p>
+          ) : allJobs.length === 0 && !videosError ? (
             <p className="x-empty">No hay videos procesados todav&#237;a.</p>
           ) : (
             <div className="videos-grid">
               {allJobs.map((j) => {
-                const isExpanded = expandedJobId === j.id
-                // Fetched by the effect above; null until it lands, so the
-                // detail panel renders progressively rather than blocking.
-                const jobResult = isExpanded ? jobDetail : null
+                const isOpen = job?.id === j.id
                 return (
-                  <div key={j.id} className="video-card">
-                    {/* Header: status + source + timestamp */}
+                  <article key={j.id} className={`video-card${isOpen ? " open" : ""}`}>
                     <div className="video-card-head">
                       <StatusBadge status={j.status} stage={j.stage} />
                       {j.source && <span className="video-card-source">{sourceLabel(j.source)}</span>}
                       <span className="video-card-date">{formatDate(j.created_at)}</span>
                     </div>
 
-                    {/* Clickable body */}
-                    <div
-                      className={`video-card-body${isExpanded ? " expanded" : ""}`}
-                      onClick={() => setExpandedJobId(isExpanded ? null : j.id)}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault()
-                          setExpandedJobId(isExpanded ? null : j.id)
-                        }
-                      }}
+                    {/* The card body is one button, and nothing interactive
+                        nests inside it -- the YouTube link and the delete
+                        button are siblings in the footer below. */}
+                    <button
+                      type="button"
+                      className="video-card-body"
+                      onClick={() => openJobFromHistory(j.id)}
+                      aria-current={isOpen ? "true" : undefined}
                     >
                       {/* YouTube jobs carry the video title; uploads only have
-                          the filename. Both come from the listing, so the card
-                          reads right before any detail is fetched. */}
-                      <div className="video-card-title">
+                          the filename. Both come from the listing. */}
+                      <span className="video-card-title">
                         {truncate(j.title || j.filename, 60) || "—"}
-                      </div>
+                      </span>
 
-                      {/* Metadata row */}
-                      <div className="video-card-meta">
-                        {j.source === "youtube" && j.url && (
-                          <a href={j.url} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>
-                            ▶️ YouTube ↗
-                          </a>
-                        )}
+                      <span className="video-card-meta">
                         {resultDuration(j) && <span>⏱ {resultDuration(j)}</span>}
                         {segmentsCount(j) && <span>{segmentsCount(j)} segmentos</span>}
                         {chapterCount(j) > 0 && <span>{chapterCount(j)} cap&#237;tulos</span>}
-                      </div>
-
-                      {/* Quick icons */}
-                      <div className="video-card-icons">
                         {hasAudio(j) && <span title="Con locuci&#243;n">🔊</span>}
                         {hasDubbed(j) && <span title="Video doblado">🎬</span>}
                         {hasSummary(j) && <span title="Resumen disponible">📝</span>}
-                      </div>
+                      </span>
 
-                      {/* Summary preview -- from the listing's own column, so a
-                          collapsed card can show it without being opened. */}
-                      {!isExpanded && j.summary_es && (
-                        <p className="video-card-summary">{truncate(j.summary_es, 120)}</p>
+                      {j.status === "failed" && j.error && (
+                        <span className="video-card-error">{truncate(j.error, 140)}</span>
                       )}
+
+                      {j.summary_es && (
+                        <span className="video-card-summary">{truncate(j.summary_es, 120)}</span>
+                      )}
+                    </button>
+
+                    <div className="video-card-foot">
+                      {j.source === "youtube" && j.url && (
+                        <a href={j.url} target="_blank" rel="noreferrer">▶️ YouTube ↗</a>
+                      )}
+                      {hasAudio(j) && (
+                        <a href={`${API_URL}/jobs/${j.id}/audio`} download>⬇️ Audio</a>
+                      )}
+                      {hasDubbed(j) && (
+                        <a href={`${API_URL}/jobs/${j.id}/video`} download>⬇️ Video</a>
+                      )}
+                      <button
+                        type="button"
+                        className="video-card-delete"
+                        title="Borrar el job y sus archivos"
+                        onClick={() => deleteJobFromHistory(j)}
+                      >
+                        🗑️
+                      </button>
                     </div>
-
-                    {/* Expanded detail */}
-                    {jobResult && (
-                      <div className="video-card-detail">
-                        {/* Full summary */}
-                        {jobResult.summary_es && (
-                          <details open>
-                            <summary>Resumen</summary>
-                            <p className="detail-text">{jobResult.summary_es}</p>
-                          </details>
-                        )}
-
-                        {jobResult.source_language === "es" && (
-                          <p className="detail-text">🌐 ES directo (sin traducir)</p>
-                        )}
-
-                        {/* Audio + dubbed video. Narration and dubbing are
-                            best-effort, so a finished job may legitimately have
-                            neither -- the flags come from the result itself. */}
-                        <div className="detail-media">
-                          {jobResult.audio_available && (
-                            <div className="detail-audio">
-                              <audio controls src={`${API_URL}/jobs/${j.id}/audio`} />
-                              <a href={`${API_URL}/jobs/${j.id}/audio`} download>
-                                ⬇️ Audio
-                              </a>
-                            </div>
-                          )}
-                          {jobResult.dubbed_video_available && (
-                            <div className="detail-video">
-                              <video controls src={`${API_URL}/jobs/${j.id}/video`} />
-                              <a href={`${API_URL}/jobs/${j.id}/video`} download>
-                                ⬇️ Video doblado
-                              </a>
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Chapters */}
-                        {jobResult.chapters?.length > 0 && (
-                          <details open>
-                            <summary>Cap&#237;tulos</summary>
-                            <ul className="detail-chapters">
-                              {jobResult.chapters.map((ch, i) => (
-                                <li key={i}>
-                                  {ch.timestamp} — {ch.title}
-                                  {jobResult.chapter_clips_available && (
-                                    <>
-                                      {" "}
-                                      <a href={`${API_URL}/jobs/${j.id}/chapters/${i}/video`} download>
-                                        ⬇️ Cap. clip
-                                      </a>
-                                    </>
-                                  )}
-                                </li>
-                              ))}
-                            </ul>
-                          </details>
-                        )}
-
-                        {/* Transcript toggle */}
-                        {jobResult.segments?.length > 0 && (
-                          <details>
-                            <summary>Transcript ({jobResult.segments.length} segmentos)</summary>
-                            <div className="detail-segments">
-                              {jobResult.segments.map((seg, i) => (
-                                <div key={i} className="segment-row">
-                                  <span className="ts">{formatTs(seg.start)}</span>
-                                  <span className="text tab-es">{seg.text_es}</span>
-                                </div>
-                              ))}
-                            </div>
-                          </details>
-                        )}
-                      </div>
-                    )}
-                  </div>
+                  </article>
                 )
               })}
             </div>
