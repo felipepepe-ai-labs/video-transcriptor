@@ -4,9 +4,14 @@
   --bg: #fff;
   --border: #e5e4e7;
   --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
+  /* One indigo accent scale; the dark overrides at the bottom flip the same
+     tokens. Components use these instead of hardcoding per-state values. */
+  --accent: #6366f1;
+  --accent-strong: #4f46e5;
+  --accent-text: #4f46e5;
+  --accent-bg: #eef2ff;
+  --accent-soft-hover: #e0e7ff;
+  --accent-border: #c7d2fe;
   --social-bg: rgba(244, 243, 236, 0.5);
   --shadow:
     rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
@@ -37,9 +42,12 @@
     --bg: #16171d;
     --border: #2e303a;
     --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
+    --accent: #6366f1;
+    --accent-strong: #4f46e5;
+    --accent-text: #a5b4fc;
+    --accent-bg: rgba(99, 102, 241, 0.2);
+    --accent-soft-hover: rgba(99, 102, 241, 0.32);
+    --accent-border: #6366f1;
     --social-bg: rgba(47, 48, 58, 0.5);
     --shadow:
       rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;

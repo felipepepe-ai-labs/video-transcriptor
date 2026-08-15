@@ -707,16 +707,14 @@ header p {
 
 /* ── Dark mode (follows system) ───────────────────────────────────── */
 
+/* Accent re-tinting for dark mode now lives in the --accent-* tokens in
+   index.css; only the non-accent (semantic: green/red) overrides stay here. */
 @media (prefers-color-scheme: dark) {
   #root {
     color: var(--text-h, #f3f4f6);
   }
   header h1 {
     color: var(--text-h, #f9fafb);
-  }
-  .drop-zone:hover,
-  .drop-zone.active {
-    background: #1e1b4b20;
   }
   .tabs button:hover,
   .input-mode-toggle button:hover {
@@ -725,63 +723,12 @@ header p {
   .chapter-remove:hover {
     color: #f87171;
   }
-  .btn-add-chapter:hover {
-    background: #1e1b4b20;
-  }
-  .chapter-pill {
-    background: #312e81;
-    color: #c7d2fe;
-  }
-  .chapter-pill:hover {
-    background: #3730a3;
-  }
-  .chapter-clip-download {
-    background: #312e81;
-  }
-  .chapter-clip-download:hover {
-    background: #3730a3;
-  }
-  .chapter-clip-regen {
-    background: #312e81;
-  }
-  .chapter-clip-regen:hover:not(:disabled) {
-    background: #3730a3;
-  }
-  .btn-regen {
-    color: #a5b4fc;
-    border-color: #6366f1;
-  }
-  .btn-regen:hover:not(:disabled) {
-    background: #1e1b4b20;
-  }
-  .chapter-heading-ts {
-    background: #312e81;
-    color: #a5b4fc;
-  }
-  .chapter-heading-count {
-    color: var(--text, #6b7280);
-  }
-  .chapter-tts-btn {
-    color: #a5b4fc;
-    border-color: #6366f1;
-  }
-  .chapter-tts-btn:hover:not(:disabled) {
-    background: #1e1b4b20;
-  }
-  .history-item.active {
-    background: var(--accent-bg, #312e81);
-    border-color: var(--accent-border, #6366f1);
-  }
   .chapter-clip-play {
     background: #14532d;
     color: #4ade80;
   }
   .chapter-clip-play:hover {
     background: #166534;
-  }
-  .btn-add-chapter {
-    color: #a5b4fc;
-    border-color: var(--border);
   }
   .history-delete:hover {
     background: #450a0a;
@@ -791,9 +738,6 @@ header p {
     background: #450a0a;
     border-color: #7f1d1d;
     color: #fca5a5;
-  }
-  .audio-download {
-    color: #a5b4fc;
   }
 }
 
