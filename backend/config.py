@@ -137,4 +137,7 @@ def media_dirs() -> dict[str, Path]:
         # Kept apart from X_DATA_DIR, which holds the cookies: credentials have
         # no business travelling with gigabytes of video.
         "x_downloads": root / "x-downloads",
+        # The bookmarks backup. It belongs on the same disk as the videos rather
+        # than next to the database: the point of it is to survive this machine.
+        "x_backup": root / "x-backup",
     }

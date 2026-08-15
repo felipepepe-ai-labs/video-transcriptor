@@ -4,7 +4,8 @@ import ChaptersEditor from "./ChaptersEditor.jsx"
 import { cleanChapters } from "./chapters.js"
 import { STAGE_LABELS } from "./stages.js"
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+// Relative so it always goes through Vite's proxy, regardless of LAN address.
+const API_URL = ""
 const JOB_POLL_INTERVAL_MS = 2000
 
 const STATUS_FILTERS = [
@@ -22,14 +23,30 @@ const STATUS_LABELS = {
   no_media: "sin video",
 }
 
-// Statuses the backend accepts a download for; no_media is retryable.
-const DOWNLOADABLE = ["interesting", "no_media"]
+// Roughly what fits in the four clamped lines of .bookmark-text. Below this the
+// toggle would expand to exactly what is already on screen.
+const TEXT_CLAMP_CHARS = 180
 
 function statusClass(status) {
   if (status === "downloaded") return "downloaded"
   if (status === "interesting") return "interesting"
   if (status === "no_media") return "no-media"
   return "new"
+}
+
+// POST /x/bookmarks/{id}/download only accepts 'interesting' and 'no_media':
+// marking a bookmark is the curation filter, and 'no_media' is there so a tweet
+// yt-dlp found no video in can be retried. Offering the button for every status
+// meant most cards answered 409 -- so the button now says why instead.
+function downloadAction(bm, busy) {
+  if (busy) return { icon: "⏳", disabled: true, title: "Descargando…" }
+  if (bm.status === "interesting" || bm.status === "no_media") {
+    return { icon: "⬇️", disabled: false, title: "Descargar video" }
+  }
+  if (bm.status === "downloaded") {
+    return { icon: "✅", disabled: true, title: "Ya descargado" }
+  }
+  return { icon: "⬇️", disabled: true, title: "Márcalo como interesante (☆) para descargarlo" }
 }
 
 function formatDate(scrapedAt) {
@@ -46,6 +63,7 @@ function XBookmarks({ onOpenJob }) {
   const [bookmarks, setBookmarks] = useState([])
   const [loading, setLoading] = useState(false)
   const [syncing, setSyncing] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState("")
   const [downloadingIds, setDownloadingIds] = useState(new Set())
   const [transcribingIds, setTranscribingIds] = useState(new Set())
@@ -60,6 +78,9 @@ function XBookmarks({ onOpenJob }) {
   const [showChapters, setShowChapters] = useState(false)
   // {jobId: {stage, segments_done, segments_total}} for jobs still running.
   const [jobStages, setJobStages] = useState({})
+  // Which cards have their full text unfolded. Kept here rather than in a
+  // per-card component so the grid stays one component, as it was.
+  const [expandedIds, setExpandedIds] = useState(new Set())
   const fileInputRef = useRef(null)
 
   // Refetch whenever the filter changes: calling refreshBookmarks() straight
@@ -146,9 +167,9 @@ function XBookmarks({ onOpenJob }) {
     return () => source.close()
   }, [])
 
-  // Which jobs are worth asking about: a bookmark that is mid-transcription.
+  // Which jobs are worth asking about: any bookmark that has a job assigned.
   const watchedKey = bookmarks
-    .filter((bm) => bm.job_id && transcribingIds.has(bm.id))
+    .filter((bm) => bm.job_id)
     .map((bm) => bm.job_id)
     .join(",")
 
@@ -239,6 +260,24 @@ function XBookmarks({ onOpenJob }) {
     }
   }
 
+  async function exportBackup() {
+    setError("")
+    setExporting(true)
+    try {
+      const res = await fetch(`${API_URL}/x/export`, { method: "POST" })
+      const body = await res.json()
+      if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
+      // Naming the directory matters: the whole point is that these files can
+      // be opened without this application.
+      setSyncMessage(`Backup guardado: ${body.markdown} ficheros en ${body.dir}`)
+      setTimeout(() => setSyncMessage(""), 8000)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setExporting(false)
+    }
+  }
+
   async function toggleInteresting(id) {
     try {
       const res = await fetch(`${API_URL}/x/bookmarks/${id}/interesting`, { method: "PATCH" })
@@ -286,6 +325,15 @@ function XBookmarks({ onOpenJob }) {
     }
   }
 
+  function toggleText(id) {
+    setExpandedIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
   async function deleteBookmark(id) {
     if (!window.confirm("¿Eliminar este bookmark?")) return
     try {
@@ -309,12 +357,14 @@ function XBookmarks({ onOpenJob }) {
           onChange={handleImportCookies}
         />
         <button
+          type="button"
           className="btn-primary"
           onClick={() => fileInputRef.current?.click()}
         >
           🍪 Importar Cookies
         </button>
         <button
+          type="button"
           className="btn-secondary"
           disabled={syncing || loading}
           onClick={handleSync}
@@ -361,7 +411,16 @@ function XBookmarks({ onOpenJob }) {
         <p className="x-empty">No hay bookmarks. Importá cookies y sincronizá primero.</p>
       ) : (
         <div className="bookmark-grid">
-          {bookmarks.map((bm) => (
+          {bookmarks.map((bm) => {
+            // The permalink pass fetches the untruncated version; fall back to
+            // the timeline's ~280 chars when it could not be reached.
+            const text = bm.expanded_text ?? bm.text ?? ""
+            const isExpanded = expandedIds.has(bm.id)
+            // Parse auto-chapters from backend JSON (if present on this bookmark).
+            const parsedChapters = bm.chapters_json ? (() => {
+              try { return JSON.parse(bm.chapters_json) } catch { return [] }
+            })() : null
+            return (
             <div key={bm.id} className="bookmark-card">
               {bm.thumbnail_url && (
                 <img
@@ -374,10 +433,33 @@ function XBookmarks({ onOpenJob }) {
               )}
               <div className="bookmark-body">
                 <span className="bookmark-author">{bm.author ?? "—"}</span>
-                <p className="bookmark-text">{bm.text ?? bm.tweet_url ?? ""}</p>
-                {bm.scraped_at && (
-                  <small className="bookmark-date">{formatDate(bm.scraped_at)}</small>
+                {text && (
+                  <p className={`bookmark-text${isExpanded ? " expanded" : ""}`}>{text}</p>
                 )}
+                {text.length > TEXT_CLAMP_CHARS && (
+                  <button
+                    type="button"
+                    className="bookmark-more"
+                    onClick={() => toggleText(bm.id)}
+                  >
+                    {isExpanded ? "Ver menos" : "Ver más"}
+                  </button>
+                )}
+                <div className="bookmark-meta">
+                  {/* The card used to print the URL as its body text, so this is
+                      the only way left to reach the tweet itself. */}
+                  <a
+                    href={bm.tweet_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="bookmark-link"
+                  >
+                    Abrir en X ↗
+                  </a>
+                  {bm.scraped_at && (
+                    <small className="bookmark-date">{formatDate(bm.scraped_at)}</small>
+                  )}
+                </div>
               </div>
               {downloadProgress[bm.id] && (
                 <div className="download-progress">
@@ -416,16 +498,19 @@ function XBookmarks({ onOpenJob }) {
                   >
                     {bm.status === "interesting" ? "⭐" : "☆"}
                   </button>
-                  {DOWNLOADABLE.includes(bm.status) && (
-                    <button
-                      title={bm.status === "no_media" ? "Reintentar descarga" : "Descargar video"}
-                      disabled={downloadingIds.has(bm.id)}
-                      onClick={() => downloadBookmark(bm.id)}
-                      aria-label={bm.status === "no_media" ? "Reintentar descarga" : "Descargar"}
-                    >
-                      {downloadingIds.has(bm.id) ? "⏳" : bm.status === "no_media" ? "🔁" : "⬇️"}
-                    </button>
-                  )}
+                  {(() => {
+                    const dl = downloadAction(bm, downloadingIds.has(bm.id))
+                    return (
+                      <button
+                        title={dl.title}
+                        disabled={dl.disabled}
+                        onClick={() => downloadBookmark(bm.id)}
+                        aria-label="Descargar"
+                      >
+                        {dl.icon}
+                      </button>
+                    )
+                  })()}
                   {bm.status === "downloaded" && !bm.job_id && (
                     <button
                       title="Transcribir y traducir (el mismo proceso que YouTube)"
@@ -455,7 +540,8 @@ function XBookmarks({ onOpenJob }) {
                 </div>
               </div>
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>

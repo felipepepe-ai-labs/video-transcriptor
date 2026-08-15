@@ -6,6 +6,8 @@ only place this subsystem was ever tested before it was adapted into this app.
 """
 
 import sqlite3
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -34,6 +36,91 @@ def _insert(conn, url, **fields):
     )
     conn.commit()
     return cur.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Where the database lives
+#
+# It used to default under tempfile.gettempdir(), which on this machine is a
+# tmpfs: every bookmark was lost on reboot. These tests exist so that never
+# silently comes back.
+# ---------------------------------------------------------------------------
+
+def test_the_default_database_does_not_live_in_temporary_storage(monkeypatch):
+    monkeypatch.delenv("X_BOOKMARKS_DB", raising=False)
+
+    resolved = xb._resolve_db_path()
+
+    assert Path(tempfile.gettempdir()) not in resolved.parents
+
+
+def test_the_default_database_sits_next_to_the_jobs_database(monkeypatch):
+    """The location .gitignore already reserved for it: backend/x_bookmarks.db."""
+    monkeypatch.delenv("X_BOOKMARKS_DB", raising=False)
+
+    resolved = xb._resolve_db_path()
+
+    assert resolved.name == "x_bookmarks.db"
+    assert resolved.parent == Path(xb.__file__).parent
+
+
+def test_an_explicit_path_still_wins(monkeypatch, tmp_path):
+    monkeypatch.setenv("X_BOOKMARKS_DB", str(tmp_path / "chosen.db"))
+
+    assert xb._resolve_db_path() == tmp_path / "chosen.db"
+
+
+def test_a_database_left_in_temporary_storage_is_adopted(tmp_path):
+    """The bookmarks stranded in tmpfs must survive the move, not be abandoned."""
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute(xb.SCHEMA)
+    conn.execute("INSERT INTO bookmarks (tweet_url) VALUES ('https://x.com/a/status/1')")
+    conn.commit()
+    conn.close()
+    target = tmp_path / "new" / "x_bookmarks.db"
+    target.parent.mkdir()
+
+    assert xb._adopt_legacy_db(target, legacy) is True
+
+    adopted = sqlite3.connect(target)
+    assert adopted.execute("SELECT count(*) FROM bookmarks").fetchone()[0] == 1
+    adopted.close()
+
+
+def test_adoption_never_overwrites_a_database_that_already_exists(tmp_path):
+    """Otherwise every restart would clobber real data with the stale copy."""
+    legacy = tmp_path / "legacy.db"
+    legacy.write_text("legacy")
+    target = tmp_path / "x_bookmarks.db"
+    target.write_text("the real one")
+
+    assert xb._adopt_legacy_db(target, legacy) is False
+    assert target.read_text() == "the real one"
+
+
+def test_adoption_is_a_no_op_when_there_is_nothing_to_adopt(tmp_path):
+    assert xb._adopt_legacy_db(tmp_path / "new.db", tmp_path / "absent.db") is False
+
+
+def test_an_empty_file_does_not_pass_for_a_database(tmp_path):
+    """A connection that beats init_db() to it leaves a 0-byte file behind.
+
+    Treating that as "already migrated" is how the adoption would quietly never
+    happen, leaving the user with an empty store and no hint that 37 bookmarks
+    were sitting in /tmp all along.
+    """
+    legacy = tmp_path / "legacy.db"
+    conn = sqlite3.connect(legacy)
+    conn.execute(xb.SCHEMA)
+    conn.execute("INSERT INTO bookmarks (tweet_url) VALUES ('https://x.com/a/status/1')")
+    conn.commit()
+    conn.close()
+    target = tmp_path / "x_bookmarks.db"
+    target.touch()  # exists, but holds nothing
+
+    assert xb._adopt_legacy_db(target, legacy) is True
+    assert target.stat().st_size > 0
 
 
 # ---------------------------------------------------------------------------

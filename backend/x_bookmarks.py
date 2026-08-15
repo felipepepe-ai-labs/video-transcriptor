@@ -6,20 +6,56 @@ local database so bookmarks survive backend restarts, independently of the
 transcription jobs system (`jobs.py`).
 """
 
+import json
+import logging
 import os
+import re
+import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 from pathlib import Path
 
 import config
 
-# Store the database on local disk (not NFS) to avoid SQLite locking issues.
-import tempfile
+logger = logging.getLogger(__name__)
+
+# Where the database used to default to, and why it moved: `tempfile.gettempdir()`
+# is /tmp, and /tmp is a tmpfs here — RAM. Every bookmark, and every review the
+# user had made by hand, was gone on the next reboot. The requirement it was
+# trying to satisfy is real (SQLite cannot lock over the CIFS mount `DATA_ROOT`
+# points at, see config.py) but "not on the network share" and "nowhere at all"
+# are different things.
+_LEGACY_DB_PATH = Path(tempfile.gettempdir()) / "video-transcriptor-x-bookmarks.db"
+
 
 def _resolve_db_path() -> Path:
-    fallback = Path(tempfile.gettempdir()) / "video-transcriptor-x-bookmarks.db"
-    return Path(os.getenv("X_BOOKMARKS_DB", str(fallback)))
+    """Local disk, next to jobs.db — the path .gitignore already reserved."""
+    default = Path(__file__).parent / "x_bookmarks.db"
+    return Path(os.getenv("X_BOOKMARKS_DB", str(default)))
+
+
+def _adopt_legacy_db(target: Path, legacy: Path = _LEGACY_DB_PATH) -> bool:
+    """Take over a database stranded in temporary storage. Returns whether it did.
+
+    Without this, the fix for the tmpfs bug would be the thing that finally lost
+    the bookmarks: the backend would open a brand-new empty file and carry on as
+    if nothing had happened.
+
+    An existing target always wins. A second run must never overwrite live data
+    with whatever stale copy is still sitting in /tmp. A zero-byte file is not a
+    database though — that is what a connection opened before init_db() leaves
+    behind, and honouring it would skip the adoption for ever, silently.
+    """
+    if not legacy.exists():
+        return False
+    if target.exists() and target.stat().st_size > 0:
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(legacy, target)
+    logger.info("adopted the bookmarks database stranded in %s → %s", legacy, target)
+    return True
 
 
 DB_PATH = _resolve_db_path()
@@ -67,7 +103,8 @@ CREATE TABLE IF NOT EXISTS bookmarks (
     transcript_original TEXT,
     transcript_language TEXT,
     transcribed_at TEXT,
-    job_id TEXT
+    job_id TEXT,
+    chapters_json TEXT
 )
 """
 
@@ -82,7 +119,38 @@ _MIGRATIONS = {
     "transcribed_at": "TEXT",
     # The transcription job in jobs.db, so a card can link back to its results.
     "job_id": "TEXT",
+    "chapters_json": "TEXT",
 }
+
+
+# Regex patterns that match timestamps in tweet text.
+# Supports formats: "0:00 Intro", "1:31 Main topic", "2:03 The agent finds"
+_TIMESTAMP_RE = re.compile(
+    r'^(?P<time>\d+:\d+(?::\d+)?)\s+(?P<title>.+)$',
+    re.MULTILINE,
+)
+
+
+def _seconds_from_timestamp(ts: str) -> int:
+    """Parse '1:31' or '2:03:45' into total seconds."""
+    parts = ts.split(':')
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+
+
+def _parse_chapters(text: str) -> str | None:
+    """Extract chapters from tweet text and return as JSON string, or None."""
+    chapters = []
+    for m in _TIMESTAMP_RE.finditer(text):
+        chapters.append({"time": _seconds_from_timestamp(m.group("time")), "title": m.group("title").strip()})
+    if not chapters:
+        # Fallback: match any "HH:MM" or "H:MM" pattern followed by title
+        for m in re.finditer(r'(\d+:\d+(?::\d+)?)\s+(.+?)(?=\n\n|$)', text):
+            chapters.append({"time": _seconds_from_timestamp(m.group(1)), "title": m.group(2).strip()})
+    if not chapters:
+        return None
+    return json.dumps(chapters)
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -100,6 +168,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 def init_db() -> None:
     """Create the bookmarks table (if missing) and apply any pending migrations."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Before the first connection, which would otherwise create an empty file
+    # and make the legacy database look like it was never there.
+    _adopt_legacy_db(DB_PATH)
     # The download directory is created on demand by download_video(); doing it
     # here would tie startup to DATA_ROOT being mounted and writable, so a
     # mistyped setting or an unplugged disk would stop the backend from booting.
@@ -137,6 +209,10 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
             "article_content": b.get("article_content"),
             "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
+        # Auto-parse chapters from tweet text (e.g. "0:00 Intro\n1:31 Main topic")
+        expanded = b.get("expanded_text")
+        if expanded:
+            row["chapters_json"] = _parse_chapters(expanded)
         if not row["tweet_url"]:
             continue
         cols = ", ".join(row.keys())
@@ -152,7 +228,8 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
         # user's curation, and a re-sync has no business undoing it.
         conn.execute(
             f"INSERT INTO bookmarks ({cols}) VALUES ({placeholders}) "
-            "ON CONFLICT(tweet_url) DO UPDATE SET expanded_text = excluded.expanded_text "
+            "ON CONFLICT(tweet_url) DO UPDATE SET expanded_text = excluded.expanded_text, "
+            "chapters_json = excluded.chapters_json "
             "WHERE excluded.expanded_text IS NOT NULL",
             list(row.values()),
         )
@@ -163,8 +240,22 @@ def sync_bookmarks(db: sqlite3.Connection, bookmarks: list[dict]) -> int:
 
 
 def list_bookmarks(db: sqlite3.Connection | None = None, status_filter: str | None = None) -> list[dict]:
-    """Return all bookmarks (excluding large text fields). Caller can fetch one via get_bookmark()."""
-    base = "SELECT id, tweet_url, author, thumbnail_url, status, local_file_path, scraped_at, downloaded_at FROM bookmarks"
+    """Return all bookmarks, minus the two genuinely unbounded columns.
+
+    `article_content` and `transcript_original` stay out — those are the ones
+    that can run to megabytes, and they are what "excluding large text fields"
+    was ever about. The tweet's own text does not belong in that category: a
+    tweet is a few hundred characters, and leaving `text`/`expanded_text` out
+    meant the card had nothing to render but the URL. `job_id`, `has_media` and
+    `transcription_status` are here because the card branches on them.
+
+    Anything omitted is still one `get_bookmark()` away.
+    """
+    base = (
+        "SELECT id, tweet_url, author, text, expanded_text, thumbnail_url, status, "
+        "local_file_path, scraped_at, downloaded_at, job_id, has_media, "
+        "transcription_status, chapters_json FROM bookmarks"
+    )
     where = ""
     params: tuple = ()
     if status_filter:

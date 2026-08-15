@@ -11,6 +11,10 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
+from dotenv import load_dotenv
+
+load_dotenv()  # read backend/.env into os.environ before anything reads it
+
 from fastapi import BackgroundTasks, FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -22,6 +26,7 @@ import dub
 import jobs
 import media_names
 import x_bookmarks as xb
+import x_export
 import youtube
 from x_sync import (
     import_cookies as _import_cookies,
@@ -42,7 +47,14 @@ from translate import translate_with_fallback
 import summarize
 
 # ── Config ────────────────────────────────────────────────────────────
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+_FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
+if _frontend_origin := os.getenv("FRONTEND_ALLOW_ORIGINS"):
+    _FRONTEND_ALLOW_ORIGINS = [o for o in _frontend_origin.split(",") if o]
+else:
+    _FRONTEND_ALLOW_ORIGINS = [_FRONTEND_ORIGIN]
+
+# Keep FRONTEND_ORIGIN for backward compatibility with code that reads it.
+FRONTEND_ORIGIN = _FRONTEND_ORIGIN
 
 # Configured first so everything below can log. Module loggers propagate to the
 # root logger, which drops anything below WARNING when nothing configured it —
@@ -83,7 +95,7 @@ app = FastAPI(title="Video Transcriptor EN → ES", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
+    allow_origins=_FRONTEND_ALLOW_ORIGINS,
     # PATCH and DELETE are used by the bookmarks UI and PUT by the settings
     # panel; without them here the browser's preflight answers 400 and the
     # buttons fail with an opaque network error.
@@ -1053,6 +1065,10 @@ def _sync_x_bookmarks_worker(session_path: str) -> None:
         return
 
     logger.info("x-sync worker finished, %d bookmarks synced", len(scraped))
+    # Every successful scrape refreshes the plain-file copy, so the backup is
+    # never staler than the last sync and nobody has to remember to press a
+    # button for it.
+    _export_bookmarks_quietly()
     x_progress.publish(
         {
             "type": "done",
@@ -1069,6 +1085,44 @@ async def list_x_bookmarks(status: str | None = None):
     """List all X bookmarks. Optionally filter by status (new, interesting, downloaded)."""
     import x_bookmarks as xb
     return xb.list_bookmarks(status_filter=status)
+
+
+@app.post("/x/export")
+async def export_x_bookmarks():
+    """Write the whole bookmarks store out as JSON + one Markdown per bookmark.
+
+    Not a background task: this is a few dozen rows of text, and the caller
+    wants to be told how many files it got.
+    """
+    try:
+        return x_export.export_bookmarks()
+    except OSError as e:
+        # Almost always DATA_ROOT pointing at an unmounted disk.
+        raise HTTPException(500, f"no se pudo escribir el backup: {e}")
+
+
+def _export_bookmarks_quietly() -> None:
+    """Refresh the backup after a sync, without ever failing the sync.
+
+    The scrape is the expensive part — three minutes of navigation — and a
+    backup that cannot be written is not a reason to throw it away. Same
+    degradation contract as narration and dubbing in the video pipeline.
+    """
+    try:
+        result = x_export.export_bookmarks()
+        logger.info("backup refreshed: %s markdown file(s)", result["markdown"])
+    except Exception:
+        logger.warning("could not refresh the bookmarks backup", exc_info=True)
+
+
+@app.get("/x/bookmarks/{id}")
+async def get_x_bookmark(id: int):
+    """One bookmark with every column, including the ones the listing leaves out."""
+    import x_bookmarks as xb
+    bm = xb.get_bookmark(id)
+    if bm is None:
+        raise HTTPException(404, "Bookmark not found")
+    return bm
 
 
 @app.patch("/x/bookmarks/{id}/interesting")

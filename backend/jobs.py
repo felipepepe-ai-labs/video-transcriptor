@@ -126,13 +126,23 @@ def delete_job(job_id: str) -> bool:
 def list_jobs(limit: int = 50) -> list[dict]:
     """Job history for the frontend list view. Excludes result_json (can be
     large for long videos) -- callers fetch a single job's full result via
-    get_job() when the user picks it from the list."""
+    get_job() when the user picks it from the list.
+
+    The history grid still needs four scalars that only live inside that blob,
+    to draw a card without opening it. JSON1's json_extract reads them out of
+    the document without materializing it, so the exclusion above holds. They
+    come back NULL for jobs that have no result yet (queued/running/failed),
+    which is what the frontend already treats as 'not available'."""
     conn = _get_conn()
     try:
         rows = conn.execute(
             "SELECT id, filename, status, stage, progress, error, "
             "segments_done, segments_total, created_at, updated_at, "
-            "source, title, url, summary_es "
+            "source, title, url, summary_es, "
+            "json_extract(result_json, '$.audio_available') AS audio_available, "
+            "json_extract(result_json, '$.dubbed_video_available') AS dubbed_video_available, "
+            "json_extract(result_json, '$.duration_seconds') AS duration_seconds, "
+            "json_array_length(json_extract(result_json, '$.chapters')) AS chapter_count "
             "FROM jobs ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()

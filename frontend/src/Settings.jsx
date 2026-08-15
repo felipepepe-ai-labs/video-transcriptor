@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+const API_URL = ""  // relative so it always goes through Vite's proxy, regardless of LAN address
 
 const LOG_LEVELS = ["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"]
 
@@ -37,7 +37,7 @@ function Settings() {
     setBrowsing(true)
     setError("")
     try {
-      const url = new URL(`${API_URL}/config/browse`)
+      const url = new URL(`${API_URL || ""}config/browse`, window.location.origin)
       if (path) url.searchParams.set("path", path)
       const res = await fetch(url)
       const body = await res.json()

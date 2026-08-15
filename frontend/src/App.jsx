@@ -7,18 +7,11 @@ import ChaptersEditor from "./ChaptersEditor.jsx"
 import { cleanChapters } from "./chapters.js"
 import { STAGE_LABELS } from "./stages.js"
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
+const API_URL = ""  // relative so it always goes through Vite's proxy, regardless of LAN address
 const POLL_INTERVAL_MS = 2000
 
-const STATUS_ICONS = {
-  queued: "⏳",
-  running: "⏳",
-  done: "✅",
-  failed: "❌",
-}
-
 function App() {
-  const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "x"
+  const [inputMode, setInputMode] = useState("file") // "file" | "youtube" | "videos" | "x" | "settings"
   const [youtubeUrl, setYoutubeUrl] = useState("")
   const [file, setFile] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -27,20 +20,26 @@ function App() {
   const [error, setError] = useState("")
   const [dragOver, setDragOver] = useState(false)
   const [tab, setTab] = useState("es") // "en" | "es"
+  // Videos procesados: history list from GET /jobs. Opening a card loads it
+  // into the main results viewer below, so there is no second detail view.
+  const [allJobs, setAllJobs] = useState([])
+  const [videosLoading, setVideosLoading] = useState(false)
+  const [videosError, setVideosError] = useState("")
+  // Set when the user explicitly asks to see a job (the 📄 button on an X
+  // bookmark, a history card). The X panel hides the viewer otherwise, so a
+  // result left over from another tab does not land under the bookmark list.
+  const [viewerRequested, setViewerRequested] = useState(false)
   const [showChapters, setShowChapters] = useState(false)
   const [chapters, setChapters] = useState([])
   const [voice, setVoice] = useState("male")
-  const [history, setHistory] = useState([])
   const [uploadProgress, setUploadProgress] = useState(null) // 0-100 while sending, null otherwise
   const [regenVoice, setRegenVoice] = useState("male")
   const [chapterAudioReady, setChapterAudioReady] = useState({}) // { [chapterIndex]: true }
   const [chapterAudioLoading, setChapterAudioLoading] = useState(null) // chapterIndex currently generating, or null
   const [playingChapterVideo, setPlayingChapterVideo] = useState(null) // chapterIndex playing inline video, or null
-  const [summaryLoading, setSummaryLoading] = useState(null) // jobId currently generating summary, or null
   const pollRef = useRef(null)
 
   useEffect(() => {
-    refreshHistory()
     return () => stopPolling()
   }, [])
 
@@ -55,36 +54,78 @@ function App() {
     setChapterAudioLoading(null)
   }, [job?.id])
 
+  // Leaving a tab ends the explicit request: coming back to X should show the
+  // bookmark list on its own, not whatever was last opened from it.
+  useEffect(() => {
+    setViewerRequested(false)
+  }, [inputMode])
+
   useEffect(() => {
     // Covers the "failed" path too, not just success -- otherwise a failed
     // chapter-audio generation left the button stuck showing its spinner.
     if (job && job.status !== "running") setChapterAudioLoading(null)
   }, [job])
 
-  async function refreshHistory() {
-    try {
-      const res = await fetch(`${API_URL}/jobs`)
-      if (!res.ok) return
-      setHistory(await res.json())
-    } catch {
-      // history is a convenience panel; ignore failures silently
-    }
+  // Load the jobs list on entering the videos tab. A failed request has to be
+  // told apart from an empty history: silently keeping the empty array would
+  // render "no hay videos" while the backend is simply unreachable.
+  useEffect(() => {
+    if (inputMode !== "videos") return
+    let cancelled = false
+    setVideosLoading(true)
+    setVideosError("")
+    fetchJobs()
+      .then((rows) => {
+        if (cancelled) return
+        if (rows) setAllJobs(rows)
+        else setVideosError("No se pudo cargar el historial de videos.")
+      })
+      .finally(() => { if (!cancelled) setVideosLoading(false) })
+    return () => { cancelled = true }
+  }, [inputMode])
+
+  // Keep badges/stages live while something is still running. The dependency
+  // is the boolean, not allJobs itself: depending on the array would re-run
+  // this on every refresh (a new array identity each time) and re-fetch in a
+  // loop, while the boolean only flips when the last running job finishes --
+  // which is exactly when the interval should stop.
+  const hasRunningJob = allJobs.some((j) => j.status === "running")
+  useEffect(() => {
+    if (inputMode !== "videos" || !hasRunningJob) return
+    let cancelled = false
+    const timer = setInterval(async () => {
+      const rows = await fetchJobs()
+      if (!cancelled && rows) setAllJobs(rows)
+    }, POLL_INTERVAL_MS)
+    return () => { cancelled = true; clearInterval(timer) }
+  }, [inputMode, hasRunningJob])
+
+  // Opening a card reuses the one results viewer the app already has (the same
+  // route XBookmarks takes), rather than rendering a second, poorer one inside
+  // the card. It stays mounted under this tab, so the user keeps their place.
+  function openJobFromHistory(jobId) {
+    openJob(jobId)
+    requestAnimationFrame(() =>
+      document.querySelector(".results, .status-message")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" })
+    )
   }
 
-  async function deleteJob(jobId, e) {
-    e.stopPropagation()
-    if (!window.confirm("¿Eliminar este trabajo del historial?")) return
+  async function deleteJobFromHistory(j) {
+    const label = truncate(j.title || j.filename, 60) || j.id
+    if (!window.confirm(`¿Borrar "${label}"?\n\nSe eliminan también su audio y video.`)) return
+    setVideosError("")
     try {
-      const res = await fetch(`${API_URL}/jobs/${jobId}`, { method: "DELETE" })
+      const res = await fetch(`${API_URL}/jobs/${j.id}`, { method: "DELETE" })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      if (job?.id === jobId) {
+      setAllJobs((rows) => rows.filter((r) => r.id !== j.id))
+      // Clear the viewer too if it was showing the job just deleted.
+      if (job?.id === j.id) {
         setJob(null)
         setResult(null)
-        stopPolling()
       }
-      refreshHistory()
     } catch (e) {
-      setError(e.message)
+      setVideosError(`No se pudo borrar: ${e.message}`)
     }
   }
 
@@ -93,6 +134,7 @@ function App() {
     setError("")
     setResult(null)
     setJob(null)
+    setViewerRequested(true)
     try {
       const res = await fetch(`${API_URL}/jobs/${jobId}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -132,13 +174,11 @@ function App() {
           setResult(data.result)
           setLoading(false)
           stopPolling()
-          refreshHistory()
           onDone?.()
         } else if (data.status === "failed") {
           setError(data.error ?? "La transcripción falló")
           setLoading(false)
           stopPolling()
-          refreshHistory()
         } else {
           pollJob(jobId, onDone)
         }
@@ -174,7 +214,6 @@ function App() {
         if (!res.ok) throw new Error(body.detail ?? `HTTP ${res.status}`)
         setJob({ status: "queued", stage: "downloading" })
         pollJob(body.job_id)
-        refreshHistory()
       } catch (e) {
         setError(e.message)
         setLoading(false)
@@ -189,7 +228,6 @@ function App() {
       setUploadProgress(null)
       setJob({ status: "queued", stage: "uploading" })
       pollJob(job_id)
-      refreshHistory()
     } catch (e) {
       setUploadProgress(null)
       setError(e.message)
@@ -253,40 +291,6 @@ function App() {
     }
   }
 
-  async function generateSummary(jobId, btnEl) {
-    setSummaryLoading(jobId)
-    setError("")
-    try {
-      const res = await fetch(`${API_URL}/jobs/${jobId}/summarize`, { method: "POST" })
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-
-      // Poll until summary appears on this job.
-      const poll = setInterval(async () => {
-        const jRes = await fetch(`${API_URL}/jobs/${jobId}`)
-        const jData = await jRes.json()
-        if (jData.result?.summary_es) {
-          clearInterval(poll)
-          setSummaryLoading(null)
-          openJob(jobId)
-          refreshHistory()
-        }
-      }, 2000)
-
-      // Timeout after 5 minutes.
-      setTimeout(() => { clearInterval(poll); setSummaryLoading(null) }, 300_000)
-    } catch (e) {
-      setError(e.message)
-      setSummaryLoading(null)
-    }
-  }
-
-  function formatDate(unixSeconds) {
-    if (!unixSeconds) return ""
-    return new Date(unixSeconds * 1000).toLocaleString("es-ES", {
-      day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
-    })
-  }
-
   function formatDuration(sec) {
     if (!sec) return "—"
     const m = Math.floor(sec / 60)
@@ -339,8 +343,19 @@ function App() {
           <button
             type="button"
             role="tab"
+            aria-selected={inputMode === "videos"}
+            className={inputMode === "videos" ? "active" : ""}
+            onClick={() => setInputMode("videos")}
+          >
+            🎞️ Videos procesados
+          </button>
+          {/* Settings is not an input source like the tabs before it, so it
+              sits apart, pushed to the far end of the row. */}
+          <button
+            type="button"
+            role="tab"
             aria-selected={inputMode === "settings"}
-            className={inputMode === "settings" ? "active" : ""}
+            className={`tab-settings${inputMode === "settings" ? " active" : ""}`}
             onClick={() => setInputMode("settings")}
           >
             ⚙️ Ajustes
@@ -446,13 +461,97 @@ function App() {
         {error && <div className="error-banner">❌ {error}</div>}
       </section>
 
+      {/* Videos procesados panel */}
+      {inputMode === "videos" && (
+        <section className="videos-list">
+          <h2>Videos procesados</h2>
+
+          {videosError && <div className="error-banner">❌ {videosError}</div>}
+
+          {videosLoading && allJobs.length === 0 ? (
+            <p className="x-empty">Cargando…</p>
+          ) : allJobs.length === 0 && !videosError ? (
+            <p className="x-empty">No hay videos procesados todav&#237;a.</p>
+          ) : (
+            <div className="videos-grid">
+              {allJobs.map((j) => {
+                const isOpen = job?.id === j.id
+                return (
+                  <article key={j.id} className={`video-card${isOpen ? " open" : ""}`}>
+                    <div className="video-card-head">
+                      <StatusBadge status={j.status} stage={j.stage} />
+                      {j.source && <span className="video-card-source">{sourceLabel(j.source)}</span>}
+                      <span className="video-card-date">{formatDate(j.created_at)}</span>
+                    </div>
+
+                    {/* The card body is one button, and nothing interactive
+                        nests inside it -- the YouTube link and the delete
+                        button are siblings in the footer below. */}
+                    <button
+                      type="button"
+                      className="video-card-body"
+                      onClick={() => openJobFromHistory(j.id)}
+                      aria-current={isOpen ? "true" : undefined}
+                    >
+                      {/* YouTube jobs carry the video title; uploads only have
+                          the filename. Both come from the listing. */}
+                      <span className="video-card-title">
+                        {truncate(j.title || j.filename, 60) || "—"}
+                      </span>
+
+                      <span className="video-card-meta">
+                        {resultDuration(j) && <span>⏱ {resultDuration(j)}</span>}
+                        {segmentsCount(j) && <span>{segmentsCount(j)} segmentos</span>}
+                        {chapterCount(j) > 0 && <span>{chapterCount(j)} cap&#237;tulos</span>}
+                        {hasAudio(j) && <span title="Con locuci&#243;n">🔊</span>}
+                        {hasDubbed(j) && <span title="Video doblado">🎬</span>}
+                        {hasSummary(j) && <span title="Resumen disponible">📝</span>}
+                      </span>
+
+                      {j.status === "failed" && j.error && (
+                        <span className="video-card-error">{truncate(j.error, 140)}</span>
+                      )}
+
+                      {j.summary_es && (
+                        <span className="video-card-summary">{truncate(j.summary_es, 120)}</span>
+                      )}
+                    </button>
+
+                    <div className="video-card-foot">
+                      {j.source === "youtube" && j.url && (
+                        <a href={j.url} target="_blank" rel="noreferrer">▶️ YouTube ↗</a>
+                      )}
+                      {hasAudio(j) && (
+                        <a href={`${API_URL}/jobs/${j.id}/audio`} download>⬇️ Audio</a>
+                      )}
+                      {hasDubbed(j) && (
+                        <a href={`${API_URL}/jobs/${j.id}/video`} download>⬇️ Video</a>
+                      )}
+                      <button
+                        type="button"
+                        className="video-card-delete"
+                        title="Borrar el job y sus archivos"
+                        onClick={() => deleteJobFromHistory(j)}
+                      >
+                        🗑️
+                      </button>
+                    </div>
+                  </article>
+                )
+              })}
+            </div>
+          )}
+        </section>
+      )}
+
       {/* X Bookmarks panel */}
       {inputMode === "x" && (
         <XBookmarks
           onOpenJob={(jobId) => {
-            // Same pipeline, same results screen -- and it already renders
-            // under whichever tab is open, so stay on X rather than dumping
-            // the user on the upload tab and losing their place in the list.
+            // Same pipeline, same results screen. openJob marks the viewer as
+            // explicitly requested, which is what lets it render here at all --
+            // so the user keeps their place in the list instead of being sent
+            // to the upload tab to read a transcript.
             openJob(jobId)
             requestAnimationFrame(() =>
               document.querySelector(".results, .status-message")
@@ -463,52 +562,11 @@ function App() {
       )}
       {inputMode === "settings" && <Settings />}
 
-      {/* History */}
-      {history.length > 0 && (
-        <section className="history-section">
-          <h2 className="history-heading">Historial</h2>
-          <ul className="history-list">
-            {history.map((h) => (
-              <li key={h.id}>
-                <button
-                  className={`history-item ${job && h.id === job.id ? "active" : ""}`}
-                  onClick={() => openJob(h.id)}
-                >
-                  <span className={`history-status status-${h.status}`}>
-                    {STATUS_ICONS[h.status] ?? "•"}
-                  </span>
-                  <span className="history-source" title={h.source === "youtube" ? "Video de YouTube" : "Archivo subido"}>
-                    {h.source === "youtube" ? "▶️" : "📁"}
-                  </span>
-                  <span className="history-filename">{h.title || h.filename}</span>
-                  <span className="history-date">{formatDate(h.created_at)}</span>
-                </button>
-                {h.status === "done" && !h.summary_es && (
-                  <button
-                    className="history-generate-summary"
-                    onClick={(e) => { e.stopPropagation(); generateSummary(h.id, e); }}
-                    title="Generar resumen"
-                    disabled={summaryLoading === h.id}
-                  >
-                    {summaryLoading === h.id ? "⏳" : "📝"}
-                  </button>
-                )}
-                <button
-                  className="history-delete"
-                  onClick={(e) => deleteJob(h.id, e)}
-                  aria-label="Eliminar trabajo"
-                  title="Eliminar"
-                >
-                  🗑️
-                </button>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
 
-      {/* Results */}
-      {result && (
+      {/* Results. In the X panel several jobs run at once, so the viewer only
+          appears for a job the user actually asked to see -- otherwise the
+          per-card progress stays the single source of truth there. */}
+      {result && (inputMode !== "x" || viewerRequested) && (
         <section className="results">
           <div className="meta-bar">
             <span>📄 {result.filename}</span>
@@ -764,7 +822,7 @@ function App() {
         </section>
       )}
 
-      {loading && uploadProgress === null && (
+      {loading && uploadProgress === null && inputMode !== "x" && (
         <div className="status-message">
           <span className="spinner"></span>
           {STAGE_LABELS[job?.stage] ?? "Enviando video a Whisper..."}
@@ -901,3 +959,91 @@ function downloadSrt(segments, lang, filename) {
 }
 
 export default App
+
+/* ── Videos procesados helpers ───────────────────────────────────── */
+
+// The listing carries everything the collapsed card needs; only the expanded
+// detail hits GET /jobs/{id}, from the effect in App().
+async function fetchJobs() {
+  try {
+    const res = await fetch(`${API_URL}/jobs`)
+    if (!res.ok) return null
+    return await res.json()
+  } catch {
+    return null
+  }
+}
+
+function sourceLabel(src) {
+  if (src === "youtube") return "▶️ YouTube"
+  return "📁 Archivo"
+}
+
+// duration_seconds is a number of seconds, unlike a segment's "HH:MM:SS.mmm"
+// start -- so this does not go through formatTs, which parses that format.
+function resultDuration(j) {
+  const total = j.duration_seconds
+  if (!total) return null
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = Math.floor(total % 60)
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m ${s}s`
+}
+
+// Map backend stage to a human label. Uses the same STAGE_LABELS as the live UI.
+function stageLabel(stage) {
+  return STAGE_LABELS[stage] ?? stage
+}
+
+function segmentsCount(j) {
+  const r = j.segments_done
+  const t = j.segments_total
+  if (r == null || t == null || t === 0) return null
+  return `${r}/${t}`
+}
+
+function chapterCount(j) {
+  return j.chapter_count ?? 0
+}
+
+function hasAudio(j) {
+  return Boolean(j.audio_available)
+}
+
+function hasDubbed(j) {
+  return Boolean(j.dubbed_video_available)
+}
+
+function hasSummary(j) {
+  return Boolean(j.summary_es)
+}
+
+// Titles scraped from X arrive as multi-line tweet text ("Marco\n@handle\n·\n6
+// ago. — ..."), so a raw slice would drop line breaks into the card. Collapse
+// whitespace first, then cut.
+function truncate(str, max) {
+  if (!str) return ""
+  const flat = str.replace(/\s+/g, " ").trim()
+  return flat.length > max ? flat.slice(0, max) + "…" : flat
+}
+
+// Status badge component used inline in the grid. 'queued' means accepted but
+// not yet picked up -- it belongs with running, not with failed.
+function StatusBadge({ status, stage }) {
+  if (status === "done") return <span className="status-badge badge-done">Listo</span>
+  if (status === "failed") return <span className="status-badge badge-failed">Fall&oacute;</span>
+  return <span className="status-badge badge-running">{stageLabel(stage) ?? "En cola"}</span>
+}
+
+// created_at/updated_at are REAL columns holding a Unix timestamp in seconds
+// (jobs.py), not an ISO string -- Date wants milliseconds.
+function formatDate(seconds) {
+  if (!seconds) return ""
+  const d = new Date(seconds * 1000)
+  if (Number.isNaN(d.getTime())) return ""
+  return d.toLocaleString("es-AR", {
+    day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit",
+    hour12: false,
+  })
+}

@@ -4,9 +4,13 @@ End-to-end tests for the async POST /jobs + GET /jobs/{id} contract.
 Drives the real FastAPI app + job worker + SRT parsing + chapter assignment
 + translation orchestration through TestClient. Only the SSH/paramiko
 boundary to the remote Whisper host is mocked, following the same
-FakeSSHClient/FakeSFTP/FakeStream pattern used in test_transcribe_e2e.py for
-the old blocking endpoint. Extended here to also fake `df` (disk pre-flight)
-and cleanup instrumentation to prove the leak-on-failure bug is fixed.
+FakeSSHClient/FakeStream pattern used in test_transcribe_e2e.py for the old
+blocking endpoint. Extended here to also fake `df` (disk pre-flight) and
+cleanup instrumentation to prove the leak-on-failure bug is fixed.
+
+Uploads run over rsync as a subprocess, so install_fake_remote() fakes that
+too -- there is no SFTP path left to fall back to, and without the fake the
+tests would try to reach the real box.
 
 Starlette's TestClient runs BackgroundTasks synchronously as part of the
 request/response cycle, so by the time client.post("/jobs") returns, the
@@ -15,7 +19,9 @@ worker has already finished -- no polling loop needed for these tests.
 import io
 import json
 import re
+import shutil
 import subprocess
+import tarfile
 import wave
 
 import httpx
@@ -55,14 +61,9 @@ def make_fake_wav(duration: float = 0.3) -> bytes:
 class FakeChannel:
     def __init__(self, exit_status):
         self._exit_status = exit_status
-        self.timeout = None
 
     def recv_exit_status(self):
         return self._exit_status
-
-    def settimeout(self, value):
-        """The SFTP channel gets a deadline so a wedged transfer raises."""
-        self.timeout = value
 
 
 class FakeStream:
@@ -74,55 +75,16 @@ class FakeStream:
         return self._data
 
 
-class FakeSFTPAttr:
-    def __init__(self, filename):
-        self.filename = filename
-
-
-class FakeSFTPFile:
-    def __init__(self, data: bytes):
-        self._data = data
-
-    def read(self):
-        return self._data
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc_info):
-        pass
-
-
-class FakeSFTP:
-    """srt_filename listing covers whisper's single-file readback;
-    piper_out_dirs covers Piper's one-wav-per-stdin-line batch output."""
-
-    def __init__(self, listdir_result, piper_out_dirs, on_put=None):
-        self._listdir_result = listdir_result
-        self._piper_out_dirs = piper_out_dirs
-        self._on_put = on_put
-
-    def put(self, local, remote, callback=None, **kwargs):
-        if self._on_put:
-            self._on_put(local, remote)
-        # Real paramiko drives the upload progress bar through this.
-        if callback:
-            callback(1, 1)
-
-    def get_channel(self):
-        return FakeChannel(0)
-
-    def listdir_attr(self, path):
-        if path in self._piper_out_dirs:
-            return [FakeSFTPAttr(fn) for fn in sorted(self._piper_out_dirs[path])]
-        return self._listdir_result
-
-    def open(self, path, mode="r"):
-        out_dir, _, filename = path.rpartition("/")
-        return FakeSFTPFile(self._piper_out_dirs[out_dir][filename])
-
-    def close(self):
-        pass
+def make_tar(files: dict[str, bytes]) -> bytes:
+    """A tar stream shaped like `tar -cf - -C <dir> .`, which is how Piper's
+    WAVs come back: members are named "./<file>", relative to the directory."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in sorted(files.items()):
+            info = tarfile.TarInfo(f"./{name}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
 
 
 class FakeStdin:
@@ -144,9 +106,9 @@ class FakeStdin:
 
 
 class FakeSSHClient:
-    """Simulates the remote Whisper+Piper host: disk check, SFTP upload,
-    `whisper` CLI (--task transcribe), `piper` CLI (batch TTS), SRT/JSON/
-    audio readback, and cleanup (`rm`) command instrumentation."""
+    """Simulates the remote Whisper+Piper host: disk check, `whisper` CLI
+    (--task transcribe), `piper` CLI (batch TTS), SRT/JSON/audio readback
+    (`ls`, `cat`, `tar`), and cleanup (`rm`) command instrumentation."""
 
     def __init__(
         self,
@@ -168,14 +130,14 @@ class FakeSSHClient:
         self.piper_out_dirs = {}  # out_dir path -> {filename: wav_bytes}
         self.upload_count = 0
 
-    def open_sftp(self):
-        listing = [FakeSFTPAttr(self.srt_filename)] if self.srt_filename else []
-        return FakeSFTP(listing, self.piper_out_dirs, on_put=self._record_upload)
-
-    def _record_upload(self, local, remote):
-        self.upload_count += 1
-
     def exec_command(self, cmd):
+        if cmd.startswith("ls -1") and ".srt" in cmd:
+            out_dir = cmd.split()[2].rsplit("/", 1)[0]
+            listing = f"{out_dir}/{self.srt_filename}\n" if self.srt_filename else ""
+            return None, FakeStream(listing.encode()), None
+        if cmd.startswith("tar -cf -"):
+            out_dir = re.search(r"-C (\S+)", cmd).group(1)
+            return None, FakeStream(make_tar(self.piper_out_dirs.get(out_dir, {}))), None
         if "df --output=avail" in cmd:
             return None, FakeStream(f"Avail\n{self.avail_kb}\n".encode()), None
         if "python3 -m whisper" in cmd:
@@ -210,13 +172,51 @@ class FakeSSHClient:
         pass
 
 
+class FakeRsync:
+    """The upload subprocess: announces 100% and exits clean."""
+
+    returncode = 0
+
+    def __init__(self):
+        self.stdout = io.StringIO("     1,024 100%    1.00MB/s    0:00:00\n")
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
 def install_fake_remote(monkeypatch, fake_client: FakeSSHClient):
-    """Bypass real paramiko: RemoteWhisper.connect() just attaches the fake."""
+    """Bypass real paramiko: RemoteWhisper.connect() just attaches the fake.
+
+    Uploads are a real rsync subprocess now, so stand in for that too --
+    otherwise these tests would shell out to the actual remote box.
+    """
 
     def fake_connect(self):
         self._ssh = fake_client
 
     monkeypatch.setattr(remote_module.RemoteWhisper, "connect", fake_connect)
+
+    # remote.subprocess IS the global subprocess module, so these patches are
+    # process-wide: anything but rsync has to reach the real implementation, or
+    # dub.py's ffmpeg calls break too (subprocess.run drives Popen as a context
+    # manager, which a stub does not implement).
+    real_popen, real_which = subprocess.Popen, shutil.which
+
+    def fake_popen(cmd, **kwargs):
+        if cmd and cmd[0] == "rsync":
+            fake_client.upload_count += 1
+            return FakeRsync()
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(
+        remote_module.shutil,
+        "which",
+        lambda name: "/usr/bin/rsync" if name == "rsync" else real_which(name),
+    )
+    monkeypatch.setattr(remote_module.subprocess, "Popen", fake_popen)
 
 
 class FakeConnectingSSHClient:
@@ -879,3 +879,13 @@ def test_work_dir_removed_when_muxing_fails(client, monkeypatch):
     assert job["status"] == "done"
     work_dir = job_video_dir(job_id) / "work"
     assert not work_dir.exists()
+
+
+def test_health_reports_whether_rsync_is_available(client, monkeypatch):
+    """Uploads have no fallback, so a box without rsync cannot run a job at
+    all. Better to see that here than half way through a 681 MB transfer."""
+    monkeypatch.setattr(app_module.shutil, "which", lambda _name: None)
+    assert client.get("/health").json()["rsync"] is False
+
+    monkeypatch.setattr(app_module.shutil, "which", lambda _name: "/usr/bin/rsync")
+    assert client.get("/health").json()["rsync"] is True
